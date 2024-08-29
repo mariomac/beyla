@@ -2,6 +2,8 @@ package otel
 
 import (
 	"context"
+	"fmt"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -555,6 +557,49 @@ func TestAppMetrics_ResourceAttributes(t *testing.T) {
 	assert.Equal(t, "upstream.beyla", attributes["source"])
 }
 
+// tests https://github.com/grafana/beyla/issues/1117
+func TestManyEntities(t *testing.T) {
+	defer restoreEnvAfterExecution()()
+
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	defer cancelCtx()
+
+	otlp, err := collector.Start(ctx)
+	require.NoError(t, err)
+
+	now := syncedClock{now: time.Now()}
+	timeNow = now.Now
+
+	otelExporter := makeExporter(ctx, t, []string{instrumentations.InstrumentationHTTP}, otlp)
+	require.NoError(t, err)
+
+	metrics := make(chan []request.Span, 1)
+	go otelExporter(metrics)
+
+	var serviceNames []string
+	for i := 0; i < 100; i++ {
+		serviceNames = append(serviceNames, fmt.Sprintf("svc-%d", i))
+	}
+	for i := 0; i < 100; i++ {
+		var submittedSpans []request.Span
+		for j := 0; j < 10; j++ {
+			svcId := serviceNames[rand.Intn(len(serviceNames))]
+			submittedSpans = append(submittedSpans, request.Span{
+				ServiceID: svc.ID{UID: svc.UID(svcId), Name: svcId},
+				Type:      request.EventTypeHTTP,
+				HostName:  svcId,
+			})
+		}
+		metrics <- submittedSpans
+	}
+
+	res := readNChan(t, otlp.Records(), 2000, timeout)
+
+	for i, r := range res {
+		assert.Equalf(t, r.ResourceAttributes["service.name"], r.Attributes["server.address"], "index: %d", i)
+	}
+}
+
 func TestMetricsConfig_Enabled(t *testing.T) {
 	assert.True(t, (&MetricsConfig{Features: []string{FeatureApplication, FeatureNetwork}, CommonEndpoint: "foo"}).Enabled())
 	assert.True(t, (&MetricsConfig{Features: []string{FeatureApplication}, MetricsEndpoint: "foo"}).Enabled())
@@ -663,10 +708,11 @@ func makeExporter(ctx context.Context, t *testing.T, instrumentations []string, 
 			CommonEndpoint:    otlp.ServerEndpoint,
 			MetricsProtocol:   ProtocolHTTPProtobuf,
 			Features:          []string{FeatureApplication},
-			TTL:               30 * time.Minute,
+			TTL:               1*time.Nanosecond, //30 * time.Minute,
 			ReportersCacheLen: 100,
 			Instrumentations:  instrumentations,
 		}, attributes.Selection{
+			"*": attributes.InclusionLists{Include: []string{"server.address"}},
 			attributes.HTTPServerDuration.Section: attributes.InclusionLists{
 				Include: []string{"url.path"},
 			},

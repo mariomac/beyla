@@ -2,6 +2,7 @@ package pipe
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -633,6 +634,65 @@ func TestSpanAttributeFilterNode(t *testing.T) {
 			string(attr.ServerAddr):             events["/user/1234"]["server.address"],
 		},
 	}, events)
+}
+
+func TestManyDifferentEntities(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tc, err := collector.Start(ctx)
+	require.NoError(t, err)
+
+	gb := newGraphBuilder(ctx, &beyla.Config{
+		Metrics: otel.MetricsConfig{
+			Features:        []string{otel.FeatureApplication},
+			MetricsEndpoint: tc.ServerEndpoint,
+			Interval:        10 * time.Millisecond,
+			ReportersCacheLen: 16,
+			TTL:               5 * time.Minute,
+			Instrumentations: []string{
+				instrumentations.InstrumentationALL,
+			},
+		},
+		Attributes: beyla.Attributes{Select: allMetrics},
+	}, gctx(0), make(<-chan []request.Span, 10000))
+
+	const numEntities = 2000
+	pipe.AddStart(gb.builder, tracesReader, func(out chan<- []request.Span) {
+		for i := 0; i < numEntities; i++ {
+			serviceName := fmt.Sprintf("service-%d", i)
+			instanceID := fmt.Sprintf("instance-%d", i)
+			out <- []request.Span{{
+				Host:         serviceName,
+				Type:         request.EventTypeHTTP,
+				ServiceID:    svc.ID{UID: svc.UID(instanceID), Name: serviceName, Instance: instanceID},
+			}, {
+				Host:         serviceName,
+				Type:         request.EventTypeHTTP,
+				ServiceID:    svc.ID{UID: svc.UID(instanceID), Name: serviceName, Instance: instanceID},
+			}}
+		}
+		// just prevents premature close of the nodes and nasty error messages on the log
+		time.Sleep(testTimeout)
+	})
+
+	pipe, err := gb.buildGraph()
+	require.NoError(t, err)
+
+	go pipe.Run(ctx)
+
+	// Check that each service.name field matches the server.address value
+	failed := 0
+	for i := 0; i < 4*numEntities; i++ {
+		event := testutil.ReadChannel(t, tc.Records(), testTimeout)
+		if event.ResourceAttributes[string(semconv.ServiceNameKey)] != event.Attributes["server.address"] {
+			failed++
+		}
+		assert.Equal(t, event.ResourceAttributes[string(semconv.ServiceNameKey)], event.Attributes["server.address"])
+	}
+	if failed > 0 {
+		t.Fatalf("failed %d out of %d entities", failed, numEntities)
+	}
 }
 
 func newRequest(serviceName string, method, path, peer string, status int) []request.Span {
