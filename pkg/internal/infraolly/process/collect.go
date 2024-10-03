@@ -30,7 +30,20 @@ import (
 	"github.com/grafana/beyla/pkg/internal/svc"
 )
 
+type Scope string
+
+const (
+	// ScopeGlobal would potentially show all the processes in the system, no matter the applications are instrumented
+	// or not. The user can anyway setup the services > discovery and filters to limit the reported processes.
+	ScopeGlobal Scope = "global"
+
+	// ScopeApp would only show these processes from applications that are actually reporting metrics or traces.
+	ScopeApp	Scope = "match_applications"
+)
+
 type CollectConfig struct {
+	Scope Scope `yaml:"scope" env:"BEYLA_PROCESSES_SCOPE"`
+
 	// RunMode defaults to "privileged". A non-privileged harvester will omit some information like open FDs.
 	// TODO: move to an upper layer
 	RunMode RunMode
