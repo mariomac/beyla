@@ -27,6 +27,14 @@ type Instrumentable struct {
 	Tracer   *ProcessTracer
 }
 
+func (i Instrumentable) PID() uint32 {
+	return uint32(i.FileInfo.Pid)
+}
+
+func (i Instrumentable) ProcessNS() uint32 {
+	return i.FileInfo.Ns
+}
+
 type PIDsAccounter interface {
 	// AllowPID notifies the tracer to accept traces from the process with the
 	// provided PID. Unless system-wide instrumentation, the Tracer should discard
