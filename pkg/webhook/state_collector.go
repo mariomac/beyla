@@ -260,7 +260,7 @@ func (c *PodStateCache) On(event *informer.Event) error {
 		if c.ownNode == "" || pod.Pod.NodeName != c.ownNode {
 			return nil
 		}
-		pc := classifyFromInformer(pod, c.matcher, scopedNamespaces(c.cfg), c.cfg.Injector.PackageVersion())
+		pc := classifyFromInformer(pod, c.matcher, scopedNamespaces(c.cfg))
 		c.mu.Lock()
 		if pc == nil {
 			delete(c.pods, uid)
@@ -326,7 +326,7 @@ func (c *PodStateCache) Collect(ch chan<- prometheus.Metric) {
 
 // classifyFromInformer classifies a pod from informer metadata, returning nil if
 // the pod is outside the configured namespace scope.
-func classifyFromInformer(pod *informer.ObjectMeta, matcher *PodMatcher, scope nsScope, currentVersion string) *PodClassification {
+func classifyFromInformer(pod *informer.ObjectMeta, matcher *PodMatcher, scope nsScope) *PodClassification {
 	ns := pod.Namespace
 	if !inScope(ns, scope) {
 		return nil
@@ -335,7 +335,7 @@ func classifyFromInformer(pod *informer.ObjectMeta, matcher *PodMatcher, scope n
 	info := processMetadataFromInformer(pod)
 	_, matched := matcher.MatchProcessInfo(info)
 
-	status, skipReason := classifyStatusFromInformer(pod, matched, currentVersion)
+	status, skipReason := classifyStatusFromInformer(pod, matched)
 
 	kind, name := resolveWorkloadFromInformer(pod)
 
@@ -358,16 +358,14 @@ func classifyFromInformer(pod *informer.ObjectMeta, matcher *PodMatcher, scope n
 // Limitation: StatusSkipped/conflict (LD_PRELOAD set to a foreign value) is not
 // detectable from informer data because LD_PRELOAD is filtered by OBI's usefulEnvVars.
 // Conflict pods appear as pending_restart.
-func classifyStatusFromInformer(pod *informer.ObjectMeta, matched bool, currentVersion string) (Status, string) {
+func classifyStatusFromInformer(pod *informer.ObjectMeta, matched bool) (Status, string) {
 	if !matched {
 		return StatusUnmatched, ""
 	}
 	if ver, ok := pod.Labels[instrumentedLabel]; ok && ver != "" {
-		if ver == currentVersion {
-			return StatusInstrumented, ""
-		}
-		// Label present but version differs — pod will be re-instrumented after restart.
-		return StatusPendingRestart, ""
+		// It might happen that label is present but version differs from the required version
+		// In that case, the controller will handle the restart
+		return StatusInstrumented, ""
 	}
 	return StatusPendingRestart, ""
 }

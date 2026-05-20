@@ -17,7 +17,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
-	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
 	"go.opentelemetry.io/obi/pkg/appolly/meta"
 	"go.opentelemetry.io/obi/pkg/appolly/services"
 	obiconfig "go.opentelemetry.io/obi/pkg/config"
@@ -390,16 +389,6 @@ network:
 		},
 		NodeJS: obi.NodeJSConfig{Enabled: true},
 		Java:   obi.JavaConfig{Enabled: true, Timeout: 10 * time.Second},
-		Injector: SDKInject{
-			HostPathVolumeDir: "/var/lib/beyla/instrumentation",
-			ManageSDKVersions: true,
-			EnabledSDKs: []servicesextra.InstrumentableType{
-				{InstrumentableType: svc.InstrumentableJava},
-				{InstrumentableType: svc.InstrumentableDotnet},
-				{InstrumentableType: svc.InstrumentableNodejs},
-				{InstrumentableType: svc.InstrumentablePython},
-			},
-		},
 	}, cfg)
 }
 

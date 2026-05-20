@@ -497,9 +497,9 @@ func TestClassifyFromInformer(t *testing.T) {
 			wantStatus: StatusInstrumented,
 		},
 		{
-			name:       "matched_stale_version_label_pending_restart",
+			name:       "matched_current_version_label_instrumented",
 			pod:        informerPod(ns, "my-pod", "uid-3", node, withInformerLabel(instrumentedLabel, "v0.9.0")),
-			wantStatus: StatusPendingRestart,
+			wantStatus: StatusInstrumented,
 		},
 		{
 			name:    "out_of_scope_system_namespace",
@@ -535,7 +535,7 @@ func TestClassifyFromInformer(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := classifyFromInformer(tt.pod, matcher, scope, version)
+			got := classifyFromInformer(tt.pod, matcher, scope)
 			if tt.wantNil {
 				assert.Nil(t, got)
 				return
@@ -552,7 +552,7 @@ func TestClassifyFromInformer(t *testing.T) {
 
 	t.Run("unmatched_in_scope", func(t *testing.T) {
 		m := nsLabelMatcher(ns, "app", "specific-app")
-		got := classifyFromInformer(informerPod(ns, "other-app", "uid-u", node), m, scope, version)
+		got := classifyFromInformer(informerPod(ns, "other-app", "uid-u", node), m, scope)
 		require.NotNil(t, got)
 		assert.Equal(t, StatusUnmatched, got.Status)
 	})
@@ -567,7 +567,6 @@ func TestPodStateCache_On(t *testing.T) {
 
 	cfg := &beyla.Config{
 		Injector: beyla.SDKInject{
-			SDKPkgVersion: version,
 			Instrument: configmap.WebhookInstrument{
 				{Metadata: services.MetadataGlobMap{services.AttrNamespace: strToGlob(ns)}},
 			},
@@ -649,7 +648,6 @@ func TestPodStateCache_Collect(t *testing.T) {
 
 	cfg := &beyla.Config{
 		Injector: beyla.SDKInject{
-			SDKPkgVersion: version,
 			Instrument: configmap.WebhookInstrument{
 				{Metadata: services.MetadataGlobMap{services.AttrNamespace: strToGlob(ns)}},
 			},

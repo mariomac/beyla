@@ -1,7 +1,6 @@
 package beyla
 
 import (
-	"crypto/sha256"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,10 +10,8 @@ import (
 	"github.com/caarlos0/env/v9"
 	otelconsumer "go.opentelemetry.io/collector/consumer"
 	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
-	"golang.org/x/mod/semver"
 	"gopkg.in/yaml.v3"
 
-	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
 	obimeta "go.opentelemetry.io/obi/pkg/appolly/meta"
 	"go.opentelemetry.io/obi/pkg/appolly/services"
 	obicfg "go.opentelemetry.io/obi/pkg/config"
@@ -68,15 +65,6 @@ func DefaultConfig() *Config {
 	}
 	def.Discovery.DefaultExcludeServices = servicesextra.DefaultExcludeServices
 	def.Discovery.DefaultExcludeInstrument = servicesextra.DefaultExcludeInstrument
-
-	def.Injector.HostPathVolumeDir = "/var/lib/beyla/instrumentation"
-	def.Injector.ManageSDKVersions = true
-	def.Injector.EnabledSDKs = []servicesextra.InstrumentableType{
-		{InstrumentableType: svc.InstrumentableJava},
-		{InstrumentableType: svc.InstrumentableDotnet},
-		{InstrumentableType: svc.InstrumentableNodejs},
-		{InstrumentableType: svc.InstrumentablePython},
-	}
 
 	def.Routes.Unmatch = transform.UnmatchLowCardinality
 
@@ -236,79 +224,14 @@ type HostIDConfig struct {
 // For SDK instrumentation on Kubernetes, use the OpenTelemetry Operator instead.
 type SDKInject struct {
 	// OTel SDK instrumentation criteria
+	// TODO: shall we use the global "instrument" section to avoid double configuration?
 	Instrument configmap.WebhookInstrument `yaml:"instrument"`
 	// Webhook configuration for a mutating admission controller
 	Webhook WebhookConfig `yaml:"webhook"`
-	// Option to disable automatic bouncing of pods, it will be
-	// a responsibility of the end-user to bounce the pods to be instrumented
-	NoAutoRestart bool `yaml:"disable_auto_restart"`
-	// OCI image mount instead of host volume, supported on k8s 1.31+
-	ImageVolumePath string `yaml:"image_volume_path"`
-	// The host path volume directory which gets mounted into pods
-	HostPathVolumeDir string `yaml:"host_path_volume"`
-	// The mutator will set the version on pods if this value is set
-	// This is used to let Beyla upgrade already instrumented services
-	// If the version doesn't match we still bounce existing pods
-	SDKPkgVersion string `yaml:"sdk_package_version"`
-	// The host mount path where the SDK copy init container copies the files.
-	// This is the root path, sdk_version is appended on top
-	HostMountPath string `yaml:"host_mount_path"`
-	// Tells Beyla that it should delete old SDK versions on the
-	// host mount volume. Default true.
-	ManageSDKVersions bool `yaml:"manage_sdk_versions"`
-	// Default sampler configuration for SDK instrumentation
-	// This is used when no sampler is specified in the selector
-	DefaultSampler *services.SamplerConfig `yaml:"sampler"`
-	// Propagators configuration for SDK instrumentation
-	// Common values: tracecontext, baggage, b3, b3multi, jaeger, xray
-	Propagators []string `yaml:"propagators"`
-	// Export configuration for SDK instrumentation
-	// Controls which signals (traces, metrics, logs) should be exported from injected SDKs
-	Export SDKExport `yaml:"export"`
-	// Resource attributes related settings
-	Resources SDKResource `yaml:"resources"`
-	// List of enabled SDK auto-instrumentations. Can be used to disable specific
-	// language instrumentations.
-	EnabledSDKs []servicesextra.InstrumentableType `yaml:"enabled_sdks"`
-	// Enables injection debugging
-	Debug bool `yaml:"debug"`
 }
 
 func (s *SDKInject) Validate() error {
-	if s.ImageVolumePath != "" {
-		if s.HostMountPath != "" {
-			return ConfigError("image_volume_path and host_mount_path are mutually exclusive, use image_volume_path on k8s 1.31+ and host_mount_path on older versions")
-		}
-
-		if s.SDKPkgVersion != "" {
-			return ConfigError("image_volume_path and sdk_package_version are mutually exclusive, use image_volume_path on k8s 1.31+ and sdk_package_version with host mount paths on older versions")
-		}
-	} else {
-		if s.SDKPkgVersion == "" {
-			return ConfigError("sdk_package_version must be supplied for the Injector component and this version must match the version used in the SDK init container")
-		} else if !semver.IsValid(s.SDKPkgVersion) {
-			return ConfigError("sdk_package_version must be in valid semantic versioning format, e.g. v0.0.1 (the v prefix is required)")
-		}
-
-		if s.ManageSDKVersions && s.HostMountPath == "" {
-			return ConfigError("host_mount_path must be supplied for the Injector component otherwise we cannot clean-up stale SDK versions")
-		}
-	}
-
 	return nil
-}
-
-func (s *SDKInject) PackageVersion() string {
-	if s.ImageVolumePath != "" {
-		h := sha256.Sum224([]byte(s.ImageVolumePath))
-		return fmt.Sprintf("%x", h) // 56 chars, fits in 63-char label limit
-	}
-
-	return s.SDKPkgVersion
-}
-
-func (s *SDKInject) UsesImageVolume() bool {
-	return s.ImageVolumePath != ""
 }
 
 // SDKExport defines which telemetry signals should be exported from injected SDKs.

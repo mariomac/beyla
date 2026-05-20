@@ -14,7 +14,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hashicorp/golang-lru/v2/simplelru"
-	"golang.org/x/mod/semver"
 
 	"go.opentelemetry.io/obi/pkg/kube"
 	"go.opentelemetry.io/obi/pkg/kube/kubecache/informer"
@@ -107,7 +106,7 @@ func NewServer(cfg *beyla.Config, ctxInfo *global.ContextInfo) (*Server, error) 
 	s := &Server{
 		cfg:                    cfg,
 		mutator:                mutator,
-		scanner:                NewInitialStateScanner(cfg.Injector.SDKPkgVersion),
+		scanner:                NewInitialStateScanner(),
 		matcher:                matcher,
 		logger:                 logger,
 		ctxInfo:                ctxInfo,
@@ -130,10 +129,6 @@ func NewServer(cfg *beyla.Config, ctxInfo *global.ContextInfo) (*Server, error) 
 // Start starts the webhook coordinator
 func (s *Server) Start(ctx context.Context) error {
 	s.logger.Info("starting communication to Injection controller")
-
-	if err := s.instrumentationManager.checkImageVolumeSupport(s.ctxInfo.K8sInformer); err != nil {
-		return err
-	}
 
 	if s.podStateCache != nil {
 		go s.subscribeStateCache(ctx)
@@ -181,23 +176,7 @@ func (s *Server) setOrUpdateInitialProcessState() error {
 }
 
 func (s *Server) establishInitialProcessState() error {
-	if err := s.setOrUpdateInitialProcessState(); err != nil {
-		return err
-	}
-
-	if !s.cfg.Injector.UsesImageVolume() && s.cfg.Injector.ManageSDKVersions {
-		oldestSDK := s.scanner.OldestSDKVersion()
-		// we could be downgrading the SDK, check if the oldest version is not
-		// newer than what we are launching with now
-		if semver.Compare(oldestSDK, s.cfg.Injector.SDKPkgVersion) > 0 {
-			oldestSDK = s.cfg.Injector.SDKPkgVersion
-		}
-
-		if err := s.instrumentationManager.cleanupOldInstrumentationVersions(s.cfg.Injector.HostMountPath, oldestSDK); err != nil {
-			s.logger.Warn("error cleaning up old instrumentation versions", "error", err)
-		}
-	}
-	return nil
+	return s.setOrUpdateInitialProcessState()
 }
 
 func (s *Server) getInitialState(ctx context.Context) error {
@@ -431,14 +410,6 @@ func (s *Server) processAttributes(event *informer.Event) ([]*ProcessInfo, error
 }
 
 func (s *Server) handleNewProcessEvent(a *ProcessInfo) {
-	// It's important to check here for the SDK supported programming languages.
-	// Go would be the killer here, since many of the Kubernetes services are written in
-	// Go, and we don't want to say bounce coredns.
-	if !s.mutator.CanInstrument(a.kind) || s.mutator.PreloadsSomethingElse(a) {
-		s.logger.Debug("ignoring process because of unsupported programming language or LD_PRELOAD", "info", a)
-		return
-	}
-
 	// The match process info only relies on the initial process state
 	// so it will not find any info on new processes. This is by design, since
 	// we don't want to do work for processes we've seen after we've launched,
