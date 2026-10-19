@@ -38,6 +38,10 @@ const (
 	// controller should consume. Its value is unused — presence is what the
 	// controller's watch predicate filters on.
 	SelectorAnnotation = "beyla.grafana.com/node"
+
+	// InjectedAnnotation is set by the external controller on SDK-injected pods.
+	// Its value identifies the injection configuration applied to the pod.
+	InjectedAnnotation = "beyla.grafana.com/inject"
 )
 
 // WebhookInstrument is the list of selectors from the Beyla injector config

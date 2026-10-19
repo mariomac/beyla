@@ -63,5 +63,9 @@ func surveyCriteria(cfg *beyla.Config) []services.Selector {
 }
 
 func surveyExcludingCriteria(cfg *beyla.Config) []services.Selector {
-	return obiDiscover.ExcludingCriteria(cfg.AsOBI())
+	// Survey uses the user's exclusions, without the SDK exclusions added for OBI instrumentation.
+	obiCfg := *cfg.AsOBI()
+	obiCfg.Discovery.DefaultExcludeServices = cfg.Discovery.DefaultExcludeServices
+	obiCfg.Discovery.DefaultExcludeInstrument = cfg.Discovery.DefaultExcludeInstrument
+	return obiDiscover.ExcludingCriteria(&obiCfg)
 }

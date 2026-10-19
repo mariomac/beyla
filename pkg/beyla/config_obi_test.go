@@ -15,6 +15,8 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app/request"
+	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
+	obiDiscover "go.opentelemetry.io/obi/pkg/appolly/discover"
 	"go.opentelemetry.io/obi/pkg/appolly/services"
 	"go.opentelemetry.io/obi/pkg/export"
 	"go.opentelemetry.io/obi/pkg/export/attributes"
@@ -27,6 +29,8 @@ import (
 	"go.opentelemetry.io/obi/pkg/transform"
 
 	"github.com/grafana/beyla/v3/pkg/export/otel/bexport"
+	servicesextra "github.com/grafana/beyla/v3/pkg/services"
+	"github.com/grafana/beyla/v3/pkg/webhook/configmap"
 )
 
 func TestCloudMetadataConfig(t *testing.T) {
@@ -260,4 +264,103 @@ func TestAsOBIHostInfoOwnership(t *testing.T) {
 	assert.True(t, bexport.Has(cfg.Discovery.Services[0].Metrics.Features, bexport.FeatureHostInfo))
 	assert.NotContains(t, cfg.OTELMetrics.ExtraSpanResourceLabels, "grafana.host.id")
 	assert.NotContains(t, cfg.Prometheus.ExtraSpanResourceLabels, "grafana.host.id")
+}
+
+func TestOBIDiscoveryExcludesInjectedSDKs(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		name := "glob selectors"
+		if legacy {
+			name = "legacy regex selectors"
+		}
+		t.Run(name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Injector.Webhook.ExternalWebhook = "system/injector"
+			cfg.Injector.EnabledSDKs = []servicesextra.InstrumentableType{
+				{InstrumentableType: svc.InstrumentableJava},
+				{InstrumentableType: svc.InstrumentableNodejs},
+			}
+			cfg.Discovery.Instrument = services.GlobDefinitionCriteria{{Path: services.NewGlob("*")}}
+			if legacy {
+				cfg.Discovery.Instrument = nil
+				cfg.Discovery.Services = services.RegexDefinitionCriteria{{Path: services.NewRegexp(".*")}}
+			}
+			original := *cfg
+			original.Injector.Webhook.ExternalWebhook = ""
+			base := original.AsOBI()
+			originalExcludes := obiDiscover.ExcludingCriteria(base)
+			originalCriteria := obiDiscover.FindingCriteria(base)
+
+			filtered := cfg.AsOBI()
+			assert.Equal(t, legacy, obiDiscover.OnlyDefinesDeprecatedServiceSelection(filtered))
+			assert.Equal(t, originalCriteria, obiDiscover.FindingCriteria(filtered), "keep broad inclusion selectors")
+			excludes := obiDiscover.ExcludingCriteria(filtered)
+			require.Len(t, excludes, len(originalExcludes)+2)
+			assert.Equal(t, originalExcludes, excludes[:len(originalExcludes)], "preserve user and default exclusions")
+			for i, language := range []string{"java", "nodejs"} {
+				selector := excludes[len(originalExcludes)+i]
+				assert.True(t, selector.GetLanguages().MatchString(language))
+				assert.False(t, selector.GetLanguages().MatchString("go"))
+				assert.False(t, selector.GetLanguages().MatchString("java_native"))
+				annotations := map[string]services.StringMatcher{}
+				for key, matcher := range selector.RangePodAnnotations() {
+					annotations[key] = matcher
+				}
+				require.Len(t, annotations, 1)
+				injected, ok := annotations[configmap.InjectedAnnotation]
+				require.True(t, ok)
+				assert.True(t, injected.MatchString("current-config-hash"))
+				assert.True(t, injected.MatchString("previous-config-hash"))
+				assert.False(t, injected.MatchString(""), "pods without SDK injection retain eBPF")
+			}
+
+			assert.Same(t, filtered, cfg.AsOBI())
+			assert.Equal(t, originalExcludes, obiDiscover.ExcludingCriteria(base), "do not mutate shared configuration")
+			assert.Equal(t, base.Discovery.DefaultExcludeInstrument, cfg.Discovery.DefaultExcludeInstrument)
+			assert.Equal(t, base.Discovery.DefaultExcludeServices, cfg.Discovery.DefaultExcludeServices)
+			cfg.invalidateOBICache()
+			assert.Len(t, obiDiscover.ExcludingCriteria(cfg.AsOBI()), len(excludes), "do not accumulate exclusions")
+		})
+	}
+}
+
+func TestOBIDiscoveryWithoutSDKInjection(t *testing.T) {
+	for _, webhookEnabled := range []bool{false, true} {
+		cfg := DefaultConfig()
+		if webhookEnabled {
+			cfg.Injector.Webhook.ExternalWebhook = "system/injector"
+			cfg.Injector.EnabledSDKs = nil
+		}
+		converted := cfg.AsOBI()
+		assert.Equal(t, cfg.Discovery.DefaultExcludeInstrument, converted.Discovery.DefaultExcludeInstrument)
+		assert.Equal(t, cfg.Discovery.DefaultExcludeServices, converted.Discovery.DefaultExcludeServices)
+	}
+}
+
+func TestOBIDiscoveryExcludesSDKsWithSpanMetrics(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		global export.Features
+		app    export.Features
+	}{
+		{name: "global OTel", global: export.FeatureSpanOTel},
+		{name: "global legacy", global: export.FeatureSpanLegacy},
+		{name: "per-application OTel", app: export.FeatureSpanOTel},
+		{name: "per-application legacy", app: export.FeatureSpanLegacy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Injector.Webhook.ExternalWebhook = "system/injector"
+			cfg.Metrics.Features = tc.global
+			cfg.Discovery.Instrument = services.GlobDefinitionCriteria{{
+				Path:    services.NewGlob("*"),
+				Metrics: perapp.SvcMetricsConfig{Features: tc.app},
+			}}
+			existing := len(cfg.Discovery.DefaultExcludeInstrument)
+
+			converted := cfg.AsOBI()
+			assert.Len(t, converted.Discovery.DefaultExcludeInstrument, existing+len(cfg.Injector.EnabledSDKs))
+			assert.Equal(t, tc.global, converted.Metrics.Features)
+			assert.Equal(t, tc.app, converted.Discovery.Instrument[0].Metrics.Features)
+		})
+	}
 }

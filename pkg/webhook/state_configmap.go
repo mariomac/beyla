@@ -15,11 +15,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
-	"go.opentelemetry.io/obi/pkg/appolly/services"
 	"go.opentelemetry.io/obi/pkg/pipe/global"
 
 	"github.com/grafana/beyla/v3/pkg/beyla"
-	servicesextra "github.com/grafana/beyla/v3/pkg/services"
 	"github.com/grafana/beyla/v3/pkg/webhook/configmap"
 )
 
@@ -238,46 +236,7 @@ func buildInjectConfig(cfg *beyla.Config, endpoint, protocol string) configmap.I
 	return configmap.InjectConfig{
 		ImageVersion: cfg.Injector.ImageVersion,
 		Rules:        rules,
-		BPFConfig: configmap.BPFConfig{
-			SpanMetrics: cfg.AsOBI().SpanMetricsEnabledForTraces(),
-			Rules:       rulesFromDiscoveryInstrument(&cfg.Discovery),
-		},
 	}
-}
-
-func ruleFromDefinition(a *services.GlobAttributes, mode configmap.Mode) *configmap.Rule {
-	sel := selectorFromGlob(a)
-
-	if sel == nil || sel.IsEmpty() {
-		return nil
-	}
-
-	return &configmap.Rule{
-		Selector: *sel,
-		Config:   configmap.RuleConfig{Mode: mode},
-	}
-}
-
-func rulesFromDiscoveryInstrument(d *servicesextra.BeylaDiscoveryConfig) []configmap.Rule {
-	var rules []configmap.Rule
-
-	exc := make(services.GlobDefinitionCriteria, 0, len(d.DefaultExcludeInstrument)+len(d.ExcludeInstrument))
-	exc = append(exc, d.DefaultExcludeInstrument...)
-	exc = append(exc, d.ExcludeInstrument...)
-
-	for i := range exc {
-		if rule := ruleFromDefinition(&exc[i], configmap.ModeSkip); rule != nil {
-			rules = append(rules, *rule)
-		}
-	}
-
-	for i := range d.Instrument {
-		if rule := ruleFromDefinition(&d.Instrument[i], configmap.ModeInstall); rule != nil {
-			rules = append(rules, *rule)
-		}
-	}
-
-	return rules
 }
 
 func otlpOrNone(enabled bool) string {

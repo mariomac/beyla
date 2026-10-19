@@ -4,10 +4,13 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/prometheus/otlptranslator"
 
+	obiDiscover "go.opentelemetry.io/obi/pkg/appolly/discover"
+	"go.opentelemetry.io/obi/pkg/appolly/services"
 	obibuildinfo "go.opentelemetry.io/obi/pkg/buildinfo"
 	"go.opentelemetry.io/obi/pkg/export/attributes"
 	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
@@ -16,6 +19,7 @@ import (
 	"github.com/grafana/beyla/v3/pkg/buildinfo"
 	"github.com/grafana/beyla/v3/pkg/export/otel"
 	cfgutil "github.com/grafana/beyla/v3/pkg/helpers/config"
+	"github.com/grafana/beyla/v3/pkg/webhook/configmap"
 )
 
 func FromOBI(c *obi.Config) *Config {
@@ -60,6 +64,7 @@ func (c *Config) invalidateOBICache() {
 // overrideOBI contains some extra tweaking that are required in the destination OBI configuration,
 // to override some behaviors such as letting the OTEL exporters to adopt the Grafana credentials
 func overrideOBI(src *Config, dst *obi.Config) {
+	excludeInjectedSDKs(src, dst)
 	// metrics && traces endpoints
 	if src.Grafana.OTLP.MetricsEnabled() {
 		dst.OTELMetrics.OTLPEndpointProvider = func() (string, bool) {
@@ -72,6 +77,36 @@ func overrideOBI(src *Config, dst *obi.Config) {
 			return otel.ResolveOTLPEndpoint(src.Traces.TracesEndpoint, src.Traces.CommonEndpoint, &src.Grafana.OTLP)
 		}
 		dst.Traces.InjectHeaders = src.Grafana.OTLP.OverrideHeaders
+	}
+}
+
+// excludeInjectedSDKs prevents OBI from instrumenting processes already covered by the SDK Injector.
+// For example, a Java process that also matches OBI's discovery criteria would otherwise
+// receive both the OpenTelemetry Java agent and the OBI Java agent.
+func excludeInjectedSDKs(cfg *Config, dst *obi.Config) {
+	if !cfg.Injector.Webhook.Enabled() || len(cfg.Injector.EnabledSDKs) == 0 {
+		return
+	}
+
+	// Unannotated pods retain eBPF while awaiting SDK injection.
+	if obiDiscover.OnlyDefinesDeprecatedServiceSelection(dst) {
+		dst.Discovery.DefaultExcludeServices = slices.Clone(dst.Discovery.DefaultExcludeServices)
+		for _, sdk := range cfg.Injector.EnabledSDKs {
+			injected := services.NewRegexp(".+")
+			dst.Discovery.DefaultExcludeServices = append(dst.Discovery.DefaultExcludeServices, services.RegexSelector{
+				Languages:      services.NewRegexp("^" + regexp.QuoteMeta(sdk.String()) + "$"),
+				PodAnnotations: map[string]*services.RegexpAttr{configmap.InjectedAnnotation: &injected},
+			})
+		}
+	} else {
+		dst.Discovery.DefaultExcludeInstrument = slices.Clone(dst.Discovery.DefaultExcludeInstrument)
+		for _, sdk := range cfg.Injector.EnabledSDKs {
+			injected := services.NewGlob("?*")
+			dst.Discovery.DefaultExcludeInstrument = append(dst.Discovery.DefaultExcludeInstrument, services.GlobAttributes{
+				Languages:      services.NewGlob(sdk.String()),
+				PodAnnotations: map[string]*services.GlobAttr{configmap.InjectedAnnotation: &injected},
+			})
+		}
 	}
 }
 
