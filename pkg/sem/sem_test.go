@@ -40,15 +40,23 @@ func deploymentOwners(deploy string) []*informer.Owner {
 	}
 }
 
+// kubeService returns the attributes of a service running in a Pod owned by a Deployment
 func kubeService(name, ns, kubeNs, pod, deploy string) svc.Attrs {
+	return kubeServiceOwner(name, ns, kubeNs, pod, "Deployment", deploy)
+}
+
+// kubeServiceOwner returns the attributes of a service as decorated by OBI, where ownerKind and
+// ownerName are the top-level owner of the Pod (the Pod itself if it does not have any owner)
+func kubeServiceOwner(name, ns, kubeNs, pod, ownerKind, ownerName string) svc.Attrs {
 	return svc.Attrs{
 		UID:         svc.UID{Name: name, Namespace: ns, Instance: kubeNs + "." + pod + "." + name},
 		SDKLanguage: svc.InstrumentableGolang,
 		HostName:    pod,
 		Metadata: map[attr.Name]string{
-			attr.K8sNamespaceName:  kubeNs,
-			attr.K8sPodName:        pod,
-			attr.K8sDeploymentName: deploy,
+			attr.K8sNamespaceName: kubeNs,
+			attr.K8sPodName:       pod,
+			attr.K8sKind:          ownerKind,
+			attr.K8sOwnerName:     ownerName,
 		},
 	}
 }
@@ -64,7 +72,11 @@ func processEvent(eventType exec.ProcessEventType, pid int, attrs svc.Attrs) *ex
 
 func relationsOf(g *graph) []relationKey { return g.sortedRelations() }
 
+// ek returns the key of an entity that is not in a Kubernetes namespace
 func ek(t, n string) entityKey { return entityKey{Type: t, Name: n} }
+
+// ekn returns the key of an entity in a Kubernetes namespace
+func ekn(t, ns, n string) entityKey { return entityKey{Type: t, Namespace: ns, Name: n} }
 
 func TestBuildGraph(t *testing.T) {
 	se := newSemanticExporter(&testCfg, &fakeWriter{}, testHost)
@@ -77,36 +89,31 @@ func TestBuildGraph(t *testing.T) {
 
 	g := se.buildGraph()
 
-	assert.Equal(t, []entityKey{
-		ek(typeKubeDeployment, "default/frontend"),
-		ek(typeKubeNamespace, "default"),
-		ek(typeKubePod, "default/frontend-1234-abcd"),
-		ek(typeProcess, "default.frontend-1234-abcd.frontend"),
-		ek(typeService, "shop/frontend"),
-		ek(typeServiceNamespace, "shop"),
-	}, g.sortedEntities())
+	deploy := ekn(typeKubeDeployment, "default", "frontend")
+	pod := ekn(typeKubePod, "default", "frontend-1234-abcd")
+	proc := ekn(typeProcess, "default", "default.frontend-1234-abcd.frontend")
+	service := ekn(typeService, "default", "shop/frontend")
+	// the OTEL service namespace is not tied to any Kubernetes namespace
+	serviceNs := ek(typeServiceNamespace, "shop")
+	assert.Equal(t, []entityKey{deploy, pod, proc, service, serviceNs}, g.sortedEntities())
 
 	assert.Equal(t, []relationKey{
-		{Type: relBelongsTo, From: ek(typeKubeDeployment, "default/frontend"), To: ek(typeKubeNamespace, "default")},
-		{Type: relBelongsTo, From: ek(typeKubePod, "default/frontend-1234-abcd"), To: ek(typeKubeDeployment, "default/frontend")},
-		{Type: relBelongsTo, From: ek(typeKubePod, "default/frontend-1234-abcd"), To: ek(typeKubeNamespace, "default")},
-		{Type: relBelongsTo, From: ek(typeService, "shop/frontend"), To: ek(typeServiceNamespace, "shop")},
-		{Type: relExecutes, From: ek(typeProcess, "default.frontend-1234-abcd.frontend"), To: ek(typeService, "shop/frontend")},
-		{Type: relRunsIn, From: ek(typeProcess, "default.frontend-1234-abcd.frontend"), To: ek(typeKubePod, "default/frontend-1234-abcd")},
-		{Type: relRunsIn, From: ek(typeService, "shop/frontend"), To: ek(typeKubeDeployment, "default/frontend")},
-		{Type: relRunsIn, From: ek(typeService, "shop/frontend"), To: ek(typeKubePod, "default/frontend-1234-abcd")},
+		{Type: relBelongsTo, From: pod, To: deploy},
+		{Type: relBelongsTo, From: service, To: serviceNs},
+		{Type: relExecutes, From: deploy, To: service},
+		{Type: relExecutes, From: proc, To: service},
+		{Type: relRunsIn, From: proc, To: pod},
+		{Type: relRunsIn, From: service, To: pod},
 	}, relationsOf(g))
 
 	assert.Equal(t, properties{
 		"pid": int64(33), "ppid": int64(1), "executablePath": "/usr/bin/server", "executableName": "server",
 		"hostId": testHost, "hostName": "frontend-1234-abcd",
-	}, g.entities[ek(typeProcess, "default.frontend-1234-abcd.frontend")])
-	assert.Equal(t, properties{
-		"podName": "frontend-1234-abcd", "kubeNamespace": "default", "uid": "uid-frontend-1234-abcd", "nodeName": "node1",
-	}, g.entities[ek(typeKubePod, "default/frontend-1234-abcd")])
+	}, g.entities[proc])
+	assert.Equal(t, properties{"uid": "uid-frontend-1234-abcd", "nodeName": "node1"}, g.entities[pod])
 	assert.Equal(t, properties{
 		"serviceName": "frontend", "serviceNamespace": "shop", "sdkLanguage": "go",
-	}, g.entities[ek(typeService, "shop/frontend")])
+	}, g.entities[service])
 
 	// the Knowledge Graph rejects the whole batch if any property uses a reserved identity key
 	for e, props := range g.entities {
@@ -114,6 +121,67 @@ func TestBuildGraph(t *testing.T) {
 			assert.NotContains(t, reservedPropertyKeys, k, "entity %v uses reserved property key %q", e, k)
 		}
 	}
+}
+
+func TestBuildGraph_WorkloadExecutesService(t *testing.T) {
+	se := newSemanticExporter(&testCfg, &fakeWriter{}, testHost)
+	// a standalone pod, without owners
+	require.NoError(t, se.On(podEvent(informer.EventType_CREATED, "default", "standalone",
+		&informer.Owner{Kind: "Pod", Name: "standalone"})))
+	// a pod owned by a StatefulSet
+	require.NoError(t, se.On(podEvent(informer.EventType_CREATED, "default", "db-0",
+		&informer.Owner{Kind: "StatefulSet", Name: "db"})))
+	// a pod owned by a DaemonSet
+	require.NoError(t, se.On(podEvent(informer.EventType_CREATED, "default", "agent-x1",
+		&informer.Owner{Kind: "DaemonSet", Name: "agent"})))
+	// a pod owned by a Job, which is owned by a CronJob
+	require.NoError(t, se.On(podEvent(informer.EventType_CREATED, "default", "backup-123-abc",
+		&informer.Owner{Kind: "Job", Name: "backup-123"}, &informer.Owner{Kind: "CronJob", Name: "backup"})))
+	// a pod owned by a non-workload object
+	require.NoError(t, se.On(podEvent(informer.EventType_CREATED, "default", "custom-1",
+		&informer.Owner{Kind: "Rollout", Name: "custom"})))
+	se.onSpans([]request.Span{
+		{Service: kubeServiceOwner("standalone", "", "default", "standalone", "Pod", "standalone")},
+		{Service: kubeServiceOwner("db", "", "default", "db-0", "StatefulSet", "db")},
+		{Service: kubeServiceOwner("agent", "", "default", "agent-x1", "DaemonSet", "agent")},
+		{Service: kubeServiceOwner("backup", "", "default", "backup-123-abc", "CronJob", "backup")},
+		{Service: kubeServiceOwner("custom", "", "default", "custom-1", "Rollout", "custom")},
+	})
+
+	g := se.buildGraph()
+	k := func(t, n string) entityKey { return ekn(t, "default", n) }
+	assert.Equal(t, []entityKey{
+		k(typeKubeCronJob, "backup"),
+		k(typeKubeDaemonSet, "agent"),
+		k(typeKubeJob, "backup-123"),
+		k(typeKubePod, "agent-x1"),
+		k(typeKubePod, "backup-123-abc"),
+		k(typeKubePod, "custom-1"),
+		k(typeKubePod, "db-0"),
+		k(typeKubePod, "standalone"),
+		k(typeKubeStatefulSet, "db"),
+		k(typeService, "agent"),
+		k(typeService, "backup"),
+		k(typeService, "custom"),
+		k(typeService, "db"),
+		k(typeService, "standalone"),
+	}, g.sortedEntities())
+	assert.Equal(t, []relationKey{
+		{Type: relBelongsTo, From: k(typeKubeJob, "backup-123"), To: k(typeKubeCronJob, "backup")},
+		{Type: relBelongsTo, From: k(typeKubePod, "agent-x1"), To: k(typeKubeDaemonSet, "agent")},
+		{Type: relBelongsTo, From: k(typeKubePod, "backup-123-abc"), To: k(typeKubeJob, "backup-123")},
+		{Type: relBelongsTo, From: k(typeKubePod, "db-0"), To: k(typeKubeStatefulSet, "db")},
+		// the top-level workload executes the service
+		{Type: relExecutes, From: k(typeKubeCronJob, "backup"), To: k(typeService, "backup")},
+		{Type: relExecutes, From: k(typeKubeDaemonSet, "agent"), To: k(typeService, "agent")},
+		{Type: relExecutes, From: k(typeKubePod, "standalone"), To: k(typeService, "standalone")},
+		{Type: relExecutes, From: k(typeKubeStatefulSet, "db"), To: k(typeService, "db")},
+		// services run in the pods that have an owner
+		{Type: relRunsIn, From: k(typeService, "agent"), To: k(typeKubePod, "agent-x1")},
+		{Type: relRunsIn, From: k(typeService, "backup"), To: k(typeKubePod, "backup-123-abc")},
+		{Type: relRunsIn, From: k(typeService, "custom"), To: k(typeKubePod, "custom-1")},
+		{Type: relRunsIn, From: k(typeService, "db"), To: k(typeKubePod, "db-0")},
+	}, relationsOf(g))
 }
 
 func TestBuildGraph_ProcessNames(t *testing.T) {
@@ -150,7 +218,7 @@ func TestBuildGraph_SpansOnly_NoKubernetes(t *testing.T) {
 	se.onSpans([]request.Span{{Service: attrs}, {Service: attrs}})
 
 	g := se.buildGraph()
-	assert.Equal(t, []entityKey{ek(typeService, "backend")}, g.sortedEntities())
+	assert.Equal(t, []entityKey{ekn(typeService, "default", "backend")}, g.sortedEntities())
 	assert.Empty(t, relationsOf(g))
 }
 
@@ -166,13 +234,8 @@ func TestBuildGraph_PodWithoutDeployment(t *testing.T) {
 	require.NoError(t, se.On(finished))
 
 	g := se.buildGraph()
-	assert.Equal(t, []entityKey{
-		ek(typeKubeNamespace, "kube-system"),
-		ek(typeKubePod, "kube-system/standalone"),
-	}, g.sortedEntities())
-	assert.Equal(t, []relationKey{
-		{Type: relBelongsTo, From: ek(typeKubePod, "kube-system/standalone"), To: ek(typeKubeNamespace, "kube-system")},
-	}, relationsOf(g))
+	assert.Equal(t, []entityKey{ekn(typeKubePod, "kube-system", "standalone")}, g.sortedEntities())
+	assert.Empty(t, relationsOf(g))
 }
 
 func TestServicesExpireAfterTTL(t *testing.T) {
@@ -213,21 +276,20 @@ func TestFlush_DeletesOnlyVolatileEntities(t *testing.T) {
 
 	se.flush(t.Context())
 	require.Len(t, fw.written, 2)
-	// Deployment, Namespaces and Service are not explicitly deleted: they will expire by TTL
-	assert.Equal(t, []entityKey{
-		ek(typeKubePod, "default/frontend-1234-abcd"),
-		ek(typeProcess, "default.frontend-1234-abcd.frontend"),
-	}, fw.deletedEntities)
+	pod := ekn(typeKubePod, "default", "frontend-1234-abcd")
+	proc := ekn(typeProcess, "default", "default.frontend-1234-abcd.frontend")
+	service := ekn(typeService, "default", "shop/frontend")
+	// Deployment, Service and ServiceNamespace are not explicitly deleted: they will expire by TTL
+	assert.Equal(t, []entityKey{pod, proc}, fw.deletedEntities)
 	assert.Equal(t, []relationKey{
-		{Type: relBelongsTo, From: ek(typeKubePod, "default/frontend-1234-abcd"), To: ek(typeKubeDeployment, "default/frontend")},
-		{Type: relBelongsTo, From: ek(typeKubePod, "default/frontend-1234-abcd"), To: ek(typeKubeNamespace, "default")},
-		{Type: relExecutes, From: ek(typeProcess, "default.frontend-1234-abcd.frontend"), To: ek(typeService, "shop/frontend")},
-		{Type: relRunsIn, From: ek(typeProcess, "default.frontend-1234-abcd.frontend"), To: ek(typeKubePod, "default/frontend-1234-abcd")},
-		{Type: relRunsIn, From: ek(typeService, "shop/frontend"), To: ek(typeKubePod, "default/frontend-1234-abcd")},
+		{Type: relBelongsTo, From: pod, To: ekn(typeKubeDeployment, "default", "frontend")},
+		{Type: relExecutes, From: proc, To: service},
+		{Type: relRunsIn, From: proc, To: pod},
+		{Type: relRunsIn, From: service, To: pod},
 	}, fw.deletedRelations)
 	// the remaining pod is still submitted
-	assert.Contains(t, fw.written[1].entities, ek(typeKubePod, "default/frontend-1234-efgh"))
-	assert.Contains(t, fw.written[1].entities, ek(typeKubeDeployment, "default/frontend"))
+	assert.Contains(t, fw.written[1].entities, ekn(typeKubePod, "default", "frontend-1234-efgh"))
+	assert.Contains(t, fw.written[1].entities, ekn(typeKubeDeployment, "default", "frontend"))
 }
 
 func TestRun_ConsumesQueues(t *testing.T) {
@@ -274,6 +336,15 @@ func TestToKGProperties_SkipsReservedKeys(t *testing.T) {
 	assert.Contains(t, out, "podName")
 }
 
+func TestKnowledgeGraph_ScopeFor(t *testing.T) {
+	kg := &knowledgeGraph{scope: map[string]string{"env": "demo"}}
+	assert.Equal(t, map[string]string{"env": "demo"}, kg.scopeFor(ek(typeServiceNamespace, "otelns")))
+	assert.Equal(t, map[string]string{"env": "demo", "namespace": "ns"},
+		kg.scopeFor(ekn(typeKubePod, "ns", "pod")))
+	// the common scope is not modified
+	assert.Equal(t, map[string]string{"env": "demo"}, kg.scope)
+}
+
 func TestKnowledgeGraph_WriteGraphBatches(t *testing.T) {
 	var mt sync.Mutex
 	var requests []graphRequest
@@ -299,39 +370,74 @@ func TestKnowledgeGraph_WriteGraphBatches(t *testing.T) {
 
 	g := newGraph()
 	for i := range maxBatchItems + 10 {
-		g.addPod(&podInfo{namespace: "ns", name: fmt.Sprintf("pod%d", i)})
+		g.addPod(&podInfo{
+			namespace: "ns", name: fmt.Sprintf("pod%d", i), uid: fmt.Sprintf("uid%d", i),
+			workloads: []entityKey{ekn(typeKubeDeployment, "ns", fmt.Sprintf("deploy%d", i))},
+		})
 	}
+	// an entity out of any Kubernetes namespace
+	g.addEntity(serviceNamespaceKey("otelns"), nil)
 	g.pruneDanglingRelations()
 	require.NoError(t, kg.writeGraph(t.Context(), g))
 
-	// 511 entities (510 pods + 1 namespace) and 510 relations: 4 batches
-	require.Len(t, requests, 4)
+	// 1021 entities (510 pods + 510 deployments + 1 service namespace) and 510 relations: 5 batches
+	require.Len(t, requests, 5)
 	assert.Len(t, requests[0].Entities, maxBatchItems)
-	assert.Empty(t, requests[0].Relationships)
+	assert.Len(t, requests[1].Entities, maxBatchItems)
 	// pending entities are flushed before starting submitting relations
-	assert.Len(t, requests[1].Entities, 11)
-	assert.Empty(t, requests[1].Relationships)
-	assert.Empty(t, requests[2].Entities)
-	assert.Len(t, requests[2].Relationships, maxBatchItems)
+	assert.Len(t, requests[2].Entities, 21)
+	for i := range 3 {
+		assert.Empty(t, requests[i].Relationships)
+	}
 	assert.Empty(t, requests[3].Entities)
-	assert.Len(t, requests[3].Relationships, 10)
+	assert.Len(t, requests[3].Relationships, maxBatchItems)
+	assert.Empty(t, requests[4].Entities)
+	assert.Len(t, requests[4].Relationships, 10)
 
-	e := requests[0].Entities[0]
-	assert.Equal(t, "beyla", e.Domain)
-	assert.Equal(t, typeKubeNamespace, e.Type)
-	assert.Equal(t, "ns", e.Name)
-	assert.Equal(t, map[string]string{"env": "demo"}, e.Scope)
-	assert.Equal(t, int64(90), e.TTLSeconds)
-	assert.Empty(t, e.Properties)
-	pod := requests[0].Entities[1]
+	// entities are sorted by type, namespace and name
+	deploy := requests[0].Entities[0]
+	assert.Equal(t, "beyla", deploy.Domain)
+	assert.Equal(t, typeKubeDeployment, deploy.Type)
+	assert.Equal(t, "deploy0", deploy.Name)
+	assert.Equal(t, map[string]string{"env": "demo", "namespace": "ns"}, deploy.Scope)
+	assert.Equal(t, int64(90), deploy.TTLSeconds)
+	assert.Empty(t, deploy.Properties)
+
+	pod := requests[1].Entities[10]
 	assert.Equal(t, typeKubePod, pod.Type)
-	assert.Equal(t, "ns/pod0", pod.Name)
-	assert.Equal(t, map[string]any{"podName": "pod0", "kubeNamespace": "ns"}, pod.Properties)
+	assert.Equal(t, "pod0", pod.Name)
+	assert.Equal(t, map[string]string{"env": "demo", "namespace": "ns"}, pod.Scope)
+	assert.Equal(t, map[string]any{"uid": "uid0"}, pod.Properties)
+
+	serviceNs := requests[2].Entities[20]
+	assert.Equal(t, typeServiceNamespace, serviceNs.Type)
+	assert.Equal(t, "otelns", serviceNs.Name)
+	assert.Equal(t, map[string]string{"env": "demo"}, serviceNs.Scope)
+
+	rel := requests[3].Relationships[0]
+	assert.Equal(t, relBelongsTo, rel.Type)
+	assert.Equal(t, graphRef{Domain: "beyla", Type: typeKubePod, Name: "pod0",
+		Scope: map[string]string{"env": "demo", "namespace": "ns"}}, rel.From)
+	assert.Equal(t, graphRef{Domain: "beyla", Type: typeKubeDeployment, Name: "deploy0",
+		Scope: map[string]string{"env": "demo", "namespace": "ns"}}, rel.To)
 }
 
 type graphRequest struct {
 	Entities      []graphItem `json:"entities"`
-	Relationships []graphItem `json:"relationships"`
+	Relationships []graphRel  `json:"relationships"`
+}
+
+type graphRel struct {
+	Type string   `json:"type"`
+	From graphRef `json:"from"`
+	To   graphRef `json:"to"`
+}
+
+type graphRef struct {
+	Domain string            `json:"domain"`
+	Type   string            `json:"type"`
+	Name   string            `json:"name"`
+	Scope  map[string]string `json:"scope"`
 }
 
 type graphItem struct {
@@ -366,18 +472,16 @@ func (f *fakeWriter) writeGraph(_ context.Context, g *graph) error {
 	return nil
 }
 
-func (f *fakeWriter) deleteEntity(_ context.Context, entityType, name string) error {
+func (f *fakeWriter) deleteEntity(_ context.Context, e entityKey) error {
 	f.mt.Lock()
 	defer f.mt.Unlock()
-	f.deletedEntities = append(f.deletedEntities, ek(entityType, name))
+	f.deletedEntities = append(f.deletedEntities, e)
 	return nil
 }
 
-func (f *fakeWriter) deleteRelationship(_ context.Context, fromType, fromName, toType, toName, relation string) error {
+func (f *fakeWriter) deleteRelationship(_ context.Context, r relationKey) error {
 	f.mt.Lock()
 	defer f.mt.Unlock()
-	f.deletedRelations = append(f.deletedRelations, relationKey{
-		Type: relation, From: ek(fromType, fromName), To: ek(toType, toName),
-	})
+	f.deletedRelations = append(f.deletedRelations, r)
 	return nil
 }

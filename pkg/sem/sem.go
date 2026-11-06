@@ -126,8 +126,8 @@ func hostID(ctxInfo *global.ContextInfo) string {
 // graphWriter abstracts the Knowledge Graph client, for testing purposes
 type graphWriter interface {
 	writeGraph(ctx context.Context, g *graph) error
-	deleteEntity(ctx context.Context, entityType, name string) error
-	deleteRelationship(ctx context.Context, fromType, fromName, toType, toName, relation string) error
+	deleteEntity(ctx context.Context, e entityKey) error
+	deleteRelationship(ctx context.Context, r relationKey) error
 }
 
 type seenService struct {
@@ -148,8 +148,8 @@ type semanticExporter struct {
 	processEvents <-chan exec.ProcessEvent
 
 	mut sync.Mutex
-	// pods by namespace/name
-	pods map[string]*podInfo
+	// pods by namespace and name
+	pods map[entityKey]*podInfo
 	// instrumented processes by PID
 	processes map[app.PID]*processInfo
 	// services seen in the spans, by service instance
@@ -167,7 +167,7 @@ func newSemanticExporter(cfg *SemanticConfig, kg graphWriter, hostID string) *se
 		kg:        kg,
 		hostID:    hostID,
 		clock:     time.Now,
-		pods:      map[string]*podInfo{},
+		pods:      map[entityKey]*podInfo{},
 		processes: map[app.PID]*processInfo{},
 		services:  map[svc.UID]*seenService{},
 	}
@@ -230,7 +230,7 @@ func (se *semanticExporter) On(event *informer.Event) error {
 	if meta == nil || meta.Pod == nil || meta.Kind != "Pod" {
 		return nil
 	}
-	key := kubeObjectName(meta.Namespace, meta.Name)
+	key := podKey(meta.Namespace, meta.Name)
 	se.mut.Lock()
 	defer se.mut.Unlock()
 	switch event.Type {
@@ -340,12 +340,12 @@ func (se *semanticExporter) flush(ctx context.Context) {
 	}
 	// relations must be removed before their entities
 	for _, r := range removedRelations {
-		if err := se.kg.deleteRelationship(ctx, r.From.Type, r.From.Name, r.To.Type, r.To.Name, r.Type); err != nil {
+		if err := se.kg.deleteRelationship(ctx, r); err != nil {
 			se.log.Debug("can't delete relationship. It will expire by TTL", "error", err)
 		}
 	}
 	for _, e := range removedEntities {
-		if err := se.kg.deleteEntity(ctx, e.Type, e.Name); err != nil {
+		if err := se.kg.deleteEntity(ctx, e); err != nil {
 			se.log.Debug("can't delete entity. It will expire by TTL", "error", err)
 		}
 	}

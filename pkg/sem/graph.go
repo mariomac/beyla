@@ -15,7 +15,10 @@ import (
 const (
 	typeKubePod          = "KubePod"
 	typeKubeDeployment   = "KubeDeployment"
-	typeKubeNamespace    = "KubeNamespace"
+	typeKubeStatefulSet  = "KubeStatefulSet"
+	typeKubeDaemonSet    = "KubeDaemonSet"
+	typeKubeJob          = "KubeJob"
+	typeKubeCronJob      = "KubeCronJob"
 	typeService          = "Service"
 	typeServiceNamespace = "ServiceNamespace"
 	typeProcess          = "Process"
@@ -28,10 +31,33 @@ const (
 	relExecutes  = "EXECUTES"
 )
 
+// workloadTypes maps the Kubernetes owner kinds to the workload entity types.
+// Other owner kinds (e.g. ReplicaSet, which is usually owned by a Deployment) are not
+// submitted to the Knowledge Graph.
+var workloadTypes = map[string]string{
+	"Deployment":  typeKubeDeployment,
+	"StatefulSet": typeKubeStatefulSet,
+	"DaemonSet":   typeKubeDaemonSet,
+	"Job":         typeKubeJob,
+	"CronJob":     typeKubeCronJob,
+}
+
+// kindPod is the owner kind that the Kubernetes informer reports when a Pod does not have any owner
+const kindPod = "Pod"
+
+// Relations between the Kubernetes workloads, pods and services:
+//   - KubePod BELONGS_TO its direct workload owner, and each workload BELONGS_TO its own
+//     workload owner (e.g. KubeJob BELONGS_TO KubeCronJob).
+//   - The top-level workload executes the service (e.g. KubeDeployment EXECUTES Service), or
+//     KubePod EXECUTES Service if the Pod does not have any owner (e.g. a standalone Pod).
+//   - Service RUNS_IN KubePod for the Pods that are owned by any other object.
+//
+// We avoid adding both a relation and its inverse (e.g. Service RUNS_IN KubeDeployment).
+
 // volatileTypes are the entity types whose lifecycle is precisely known by Beyla
 // (Kubernetes informer deletion events, process termination events). When they disappear
 // from the graph, Beyla explicitly deletes them, as well as any relation pointing to/from them.
-// The rest of entities (namespaces, deployments, services...) might be shared with other Beyla
+// The rest of entities (deployments, services...) might be shared with other Beyla
 // instances, so they are never deleted explicitly and just expire by TTL when nobody refreshes them.
 var volatileTypes = map[string]struct{}{
 	typeKubePod: {},
@@ -43,9 +69,14 @@ func isVolatile(entityType string) bool {
 	return ok
 }
 
+// entityKey identifies an entity in the Knowledge Graph, together with the common scope.
 type entityKey struct {
 	Type string
-	Name string
+	// Namespace is the Kubernetes namespace of the entity. It is submitted as the "namespace"
+	// scope key, so entities with the same name in different namespaces are different entities.
+	// Empty for entities that are not in a Kubernetes namespace.
+	Namespace string
+	Name      string
 }
 
 // entity properties. Values can be either string, int64 or bool.
@@ -78,8 +109,7 @@ func newGraph() *graph {
 	}
 }
 
-func (g *graph) addEntity(eType, name string, props properties) entityKey {
-	key := entityKey{Type: eType, Name: name}
+func (g *graph) addEntity(key entityKey, props properties) entityKey {
 	current, ok := g.entities[key]
 	if !ok || current == nil {
 		g.entities[key] = props
@@ -139,7 +169,7 @@ func (g *graph) sortedRelations() []relationKey {
 }
 
 func compareEntityKeys(a, b entityKey) int {
-	return cmp.Or(cmp.Compare(a.Type, b.Type), cmp.Compare(a.Name, b.Name))
+	return cmp.Or(cmp.Compare(a.Type, b.Type), cmp.Compare(a.Namespace, b.Namespace), cmp.Compare(a.Name, b.Name))
 }
 
 // removedVolatile returns the entities and relations from the old graph that do not exist anymore
@@ -165,13 +195,25 @@ func removedVolatile(old, current *graph) ([]entityKey, []relationKey) {
 }
 
 // Entity naming. The Knowledge Graph identifies entities by domain + type + name + scope,
-// so the names below must be unique within each entity type.
+// so the names below must be unique within each entity type and Kubernetes namespace.
 
-func kubeNamespaceName(ns string) string { return ns }
+func podKey(ns, name string) entityKey {
+	return entityKey{Type: typeKubePod, Namespace: ns, Name: name}
+}
 
-func kubeObjectName(ns, name string) string { return ns + "/" + name }
+// workloadKey returns false if the owner kind is not submitted as a workload entity
+func workloadKey(ns, kind, name string) (entityKey, bool) {
+	eType, ok := workloadTypes[kind]
+	if !ok || name == "" {
+		return entityKey{}, false
+	}
+	return entityKey{Type: eType, Namespace: ns, Name: name}, true
+}
 
-func serviceNamespaceName(ns string) string { return ns }
+// serviceNamespaceKey refers to the OTEL service.namespace, which is not tied to any Kubernetes namespace
+func serviceNamespaceKey(ns string) entityKey {
+	return entityKey{Type: typeServiceNamespace, Name: ns}
+}
 
 func serviceName(uid svc.UID) string {
 	if uid.Namespace == "" {
@@ -193,11 +235,13 @@ func processName(instance, hostID string, pid app.PID) string {
 
 // podInfo is the information about a Kubernetes Pod, as received from the Kubernetes informer
 type podInfo struct {
-	namespace   string
-	name        string
-	uid         string
-	nodeName    string
-	deployments []string
+	namespace string
+	name      string
+	uid       string
+	nodeName  string
+	// workloads that own the Pod, from the direct owner to the top-level owner
+	// (e.g. Job, CronJob). Owners that are not workload entities (e.g. ReplicaSet) are skipped.
+	workloads []entityKey
 }
 
 func podInfoFrom(meta *informer.ObjectMeta) *podInfo {
@@ -207,9 +251,11 @@ func podInfoFrom(meta *informer.ObjectMeta) *podInfo {
 		uid:       meta.Pod.Uid,
 		nodeName:  meta.Pod.NodeName,
 	}
+	// the informer reports the owners from the direct owner to the top-level owner,
+	// e.g. ReplicaSet, Deployment
 	for _, owner := range meta.Pod.Owners {
-		if owner.Kind == "Deployment" {
-			pi.deployments = append(pi.deployments, owner.Name)
+		if wk, ok := workloadKey(meta.Namespace, owner.Kind, owner.Name); ok {
+			pi.workloads = append(pi.workloads, wk)
 		}
 	}
 	return pi
@@ -218,20 +264,24 @@ func podInfoFrom(meta *informer.ObjectMeta) *podInfo {
 // serviceInfo is the information about an instrumented service, as received from
 // the process discovery events and the instrumented spans
 type serviceInfo struct {
-	uid        svc.UID
-	language   string
-	kubeNs     string
-	kubePod    string
-	kubeDeploy string
+	uid      svc.UID
+	language string
+	kubeNs   string
+	kubePod  string
+	// kind and name of the top-level owner of the Pod. If the Pod does not have any owner,
+	// the kind is "Pod" and the name is the Pod name.
+	kubeOwnerKind string
+	kubeOwnerName string
 }
 
 func serviceInfoFrom(attrs *svc.Attrs) serviceInfo {
 	return serviceInfo{
-		uid:        attrs.UID,
-		language:   attrs.SDKLanguage.String(),
-		kubeNs:     attrs.Metadata[attr.K8sNamespaceName],
-		kubePod:    attrs.Metadata[attr.K8sPodName],
-		kubeDeploy: attrs.Metadata[attr.K8sDeploymentName],
+		uid:           attrs.UID,
+		language:      attrs.SDKLanguage.String(),
+		kubeNs:        attrs.Metadata[attr.K8sNamespaceName],
+		kubePod:       attrs.Metadata[attr.K8sPodName],
+		kubeOwnerKind: attrs.Metadata[attr.K8sKind],
+		kubeOwnerName: attrs.Metadata[attr.K8sOwnerName],
 	}
 }
 
@@ -246,26 +296,18 @@ type processInfo struct {
 }
 
 func (g *graph) addPod(pod *podInfo) {
-	nsKey := g.addEntity(typeKubeNamespace, kubeNamespaceName(pod.namespace), nil)
-	podProps := properties{
-		"podName":       pod.name,
-		"kubeNamespace": pod.namespace,
-	}
+	podProps := properties{}
 	if pod.uid != "" {
 		podProps["uid"] = pod.uid
 	}
 	if pod.nodeName != "" {
 		podProps["nodeName"] = pod.nodeName
 	}
-	podKey := g.addEntity(typeKubePod, kubeObjectName(pod.namespace, pod.name), podProps)
-	g.addRelation(relBelongsTo, podKey, nsKey)
-	for _, deploy := range pod.deployments {
-		deployKey := g.addEntity(typeKubeDeployment, kubeObjectName(pod.namespace, deploy), properties{
-			"deploymentName": deploy,
-			"kubeNamespace":  pod.namespace,
-		})
-		g.addRelation(relBelongsTo, deployKey, nsKey)
-		g.addRelation(relBelongsTo, podKey, deployKey)
+	child := g.addEntity(podKey(pod.namespace, pod.name), podProps)
+	for _, wk := range pod.workloads {
+		g.addEntity(wk, nil)
+		g.addRelation(relBelongsTo, child, wk)
+		child = wk
 	}
 }
 
@@ -282,19 +324,23 @@ func (g *graph) addService(si *serviceInfo) (entityKey, bool) {
 	if si.language != "" {
 		props["sdkLanguage"] = si.language
 	}
-	svcKey := g.addEntity(typeService, serviceName(si.uid), props)
+	svcKey := g.addEntity(entityKey{Type: typeService, Namespace: si.kubeNs, Name: serviceName(si.uid)}, props)
 	if si.uid.Namespace != "" {
-		nsKey := g.addEntity(typeServiceNamespace, serviceNamespaceName(si.uid.Namespace), nil)
+		nsKey := g.addEntity(serviceNamespaceKey(si.uid.Namespace), nil)
 		g.addRelation(relBelongsTo, svcKey, nsKey)
 	}
 	// The Kubernetes entities are added from the informer. Here we just add the relations,
 	// that will be pruned later if the Kubernetes entities are not known
-	if si.kubeNs != "" {
-		if si.kubePod != "" {
-			g.addRelation(relRunsIn, svcKey, entityKey{Type: typeKubePod, Name: kubeObjectName(si.kubeNs, si.kubePod)})
-		}
-		if si.kubeDeploy != "" {
-			g.addRelation(relRunsIn, svcKey, entityKey{Type: typeKubeDeployment, Name: kubeObjectName(si.kubeNs, si.kubeDeploy)})
+	if si.kubeNs != "" && si.kubePod != "" {
+		pk := podKey(si.kubeNs, si.kubePod)
+		if si.kubeOwnerKind == kindPod {
+			// standalone Pod: the Pod itself is the top-level workload
+			g.addRelation(relExecutes, pk, svcKey)
+		} else {
+			g.addRelation(relRunsIn, svcKey, pk)
+			if wk, ok := workloadKey(si.kubeNs, si.kubeOwnerKind, si.kubeOwnerName); ok {
+				g.addRelation(relExecutes, wk, svcKey)
+			}
 		}
 	}
 	return svcKey, true
@@ -317,11 +363,14 @@ func (g *graph) addProcess(hostID string, proc *processInfo) entityKey {
 	if proc.hostName != "" {
 		props["hostName"] = proc.hostName
 	}
-	procKey := g.addEntity(typeProcess, processName(proc.service.uid.Instance, hostID, proc.pid), props)
+	procKey := g.addEntity(entityKey{
+		Type:      typeProcess,
+		Namespace: proc.service.kubeNs,
+		Name:      processName(proc.service.uid.Instance, hostID, proc.pid),
+	}, props)
 	// as for the services, the relation is pruned later if the Pod is not known by the informer
 	if proc.service.kubeNs != "" && proc.service.kubePod != "" {
-		g.addRelation(relRunsIn, procKey,
-			entityKey{Type: typeKubePod, Name: kubeObjectName(proc.service.kubeNs, proc.service.kubePod)})
+		g.addRelation(relRunsIn, procKey, podKey(proc.service.kubeNs, proc.service.kubePod))
 	}
 	if svcKey, ok := g.addService(&proc.service); ok {
 		g.addRelation(relExecutes, procKey, svcKey)

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"strings"
@@ -29,6 +30,8 @@ const (
 	// maximum number of entities+relationships in a single WriteGraph request
 	// (default value of the kg-write.batch.max-items server property)
 	maxBatchItems = 500
+	// scope key for the Kubernetes namespace of the entities
+	scopeNamespace = "namespace"
 )
 
 type gatewayConfig struct {
@@ -96,7 +99,7 @@ func (kg *knowledgeGraph) writeGraph(ctx context.Context, g *graph) error {
 	}
 	for _, e := range entities {
 		dto := kgwrite.NewEntityWriteRequestDto(kg.domain, e.Type, e.Name, kg.ttlSeconds)
-		dto.SetScope(kg.scope)
+		dto.SetScope(kg.scopeFor(e))
 		if props := g.entities[e]; len(props) > 0 {
 			dto.SetProperties(toKGProperties(props))
 		}
@@ -110,8 +113,8 @@ func (kg *knowledgeGraph) writeGraph(ctx context.Context, g *graph) error {
 	for _, r := range relations {
 		from := kgwrite.NewEntityRefDto(kg.domain, r.From.Type, r.From.Name)
 		to := kgwrite.NewEntityRefDto(kg.domain, r.To.Type, r.To.Name)
-		from.SetScope(kg.scope)
-		to.SetScope(kg.scope)
+		from.SetScope(kg.scopeFor(r.From))
+		to.SetScope(kg.scopeFor(r.To))
 		batch.Relationships = append(batch.Relationships,
 			*kgwrite.NewRelationshipWriteRequestDto(kg.domain, r.Type, *from, *to, kg.ttlSeconds))
 		if items++; items >= maxBatchItems {
@@ -159,51 +162,61 @@ func toKGProperties(props properties) map[string]kgwrite.KgPropertyValue {
 	return out
 }
 
-func (kg *knowledgeGraph) deleteRelationship(ctx context.Context, fromType, fromName, toType, toName, relation string) error {
-	kg.log.Debug("deleting relationship", "type", relation,
-		"fromType", fromType, "fromName", fromName,
-		"toType", toType, "toName", toName)
+func (kg *knowledgeGraph) deleteRelationship(ctx context.Context, r relationKey) error {
+	kg.log.Debug("deleting relationship", "type", r.Type, "from", r.From, "to", r.To)
 	response, err := kg.client.KnowledgeGraphWriteAPIAPI.
 		DeleteRelationship(ctx, kg.namespace).
 		XScopeOrgID(kg.stackID).
-		Type_(relation).
+		Type_(r.Type).
 		FromDomain(kg.domain).
-		FromType(fromType).
-		FromName(fromName).
-		FromScope(kg.scope).
+		FromType(r.From.Type).
+		FromName(r.From.Name).
+		FromScope(kg.scopeFor(r.From)).
 		ToDomain(kg.domain).
-		ToType(toType).
-		ToName(toName).
-		ToScope(kg.scope).
+		ToType(r.To.Type).
+		ToName(r.To.Name).
+		ToScope(kg.scopeFor(r.To)).
 		Execute()
 	if err != nil {
-		return fmt.Errorf("delete relationship %s failed: %w", relation, err)
+		return fmt.Errorf("delete relationship %s failed: %w%s", r.Type, err, errorBody(err))
 	}
 	if response == nil || response.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("delete relationship %s returned unexpected status %s", relation, status(response))
+		return fmt.Errorf("delete relationship %s returned unexpected status %s", r.Type, status(response))
 	}
 	kg.log.Debug("deleted relationship", "status", status(response))
 	return nil
 }
 
-func (kg *knowledgeGraph) deleteEntity(ctx context.Context, entityType, name string) error {
-	kg.log.Debug("deleting entity", "type", entityType, "name", name)
+func (kg *knowledgeGraph) deleteEntity(ctx context.Context, e entityKey) error {
+	kg.log.Debug("deleting entity", "entity", e)
 	response, err := kg.client.KnowledgeGraphWriteAPIAPI.
 		DeleteEntity(ctx, kg.namespace).
 		XScopeOrgID(kg.stackID).
 		Domain(kg.domain).
-		Type_(entityType).
-		Name(name).
-		Scope(kg.scope).
+		Type_(e.Type).
+		Name(e.Name).
+		Scope(kg.scopeFor(e)).
 		Execute()
 	if err != nil {
-		return fmt.Errorf("delete entity %s/%s failed: %w", entityType, name, err)
+		return fmt.Errorf("delete entity %s/%s failed: %w%s", e.Type, e.Name, err, errorBody(err))
 	}
 	if response == nil || response.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("delete entity %s/%s returned unexpected status %s", entityType, name, status(response))
+		return fmt.Errorf("delete entity %s/%s returned unexpected status %s", e.Type, e.Name, status(response))
 	}
-	kg.log.Debug("deleted entity", "type", entityType, "name", name, "status", status(response))
+	kg.log.Debug("deleted entity", "entity", e, "status", status(response))
 	return nil
+}
+
+// scopeFor returns the scope of the entity: the common scope plus, if the entity is in
+// a Kubernetes namespace, the "namespace" scope key
+func (kg *knowledgeGraph) scopeFor(e entityKey) map[string]string {
+	if e.Namespace == "" {
+		return kg.scope
+	}
+	scope := make(map[string]string, len(kg.scope)+1)
+	maps.Copy(scope, kg.scope)
+	scope[scopeNamespace] = e.Namespace
+	return scope
 }
 
 func configureGateway(cellGatewayURL, stackID, token string) (gatewayConfig, error) {
