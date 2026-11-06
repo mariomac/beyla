@@ -4,10 +4,13 @@ import (
 	"cmp"
 	"slices"
 	"strconv"
+	"strings"
 
 	"go.opentelemetry.io/obi/pkg/appolly/app"
 	"go.opentelemetry.io/obi/pkg/appolly/app/svc"
+	"go.opentelemetry.io/obi/pkg/export/attributes"
 	attr "go.opentelemetry.io/obi/pkg/export/attributes/names"
+	"go.opentelemetry.io/obi/pkg/kube"
 	"go.opentelemetry.io/obi/pkg/kube/kubecache/informer"
 )
 
@@ -83,6 +86,8 @@ func isVolatile(entityType string) bool {
 // entityKey identifies an entity in the Knowledge Graph, together with the common scope.
 type entityKey struct {
 	Type string
+	// Env is the deployment environment of the entity, submitted as the "env" scope key.
+	Env string
 	// Namespace is the Kubernetes namespace of the entity. It is submitted as the "namespace"
 	// scope key, so entities with the same name in different namespaces are different entities.
 	// Empty for entities that are not in a Kubernetes namespace.
@@ -180,7 +185,8 @@ func (g *graph) sortedRelations() []relationKey {
 }
 
 func compareEntityKeys(a, b entityKey) int {
-	return cmp.Or(cmp.Compare(a.Type, b.Type), cmp.Compare(a.Namespace, b.Namespace), cmp.Compare(a.Name, b.Name))
+	return cmp.Or(cmp.Compare(a.Type, b.Type), cmp.Compare(a.Env, b.Env),
+		cmp.Compare(a.Namespace, b.Namespace), cmp.Compare(a.Name, b.Name))
 }
 
 // removedVolatile returns the entities and relations from the old graph that do not exist anymore
@@ -197,9 +203,11 @@ func removedVolatile(old, current *graph) ([]entityKey, []relationKey) {
 		}
 	}
 	var relations []relationKey
-	for _, r := range old.sortedRelations() {
-		if _, ok := current.relations[r]; !ok && (isVolatile(r.From.Type) || isVolatile(r.To.Type)) {
-			relations = append(relations, r)
+	oldRelations := old.sortedRelations()
+	for i := range oldRelations {
+		r := &oldRelations[i]
+		if _, ok := current.relations[*r]; !ok && (isVolatile(r.From.Type) || isVolatile(r.To.Type)) {
+			relations = append(relations, *r)
 		}
 	}
 	return entities, relations
@@ -208,29 +216,64 @@ func removedVolatile(old, current *graph) ([]entityKey, []relationKey) {
 // Entity naming. The Knowledge Graph identifies entities by domain + type + name + scope,
 // so the names below must be unique within each entity type and Kubernetes namespace.
 
-func podKey(ns, name string) entityKey {
-	return entityKey{Type: typePod, Namespace: ns, Name: name}
-}
-
 // workloadKey returns false if the owner kind is not submitted as a workload entity
-func workloadKey(ns, kind, name string) (entityKey, bool) {
+func workloadKey(env, ns, kind, name string) (entityKey, bool) {
 	eType, ok := workloadTypes[kind]
 	if !ok || name == "" {
 		return entityKey{}, false
 	}
-	return entityKey{Type: eType, Namespace: ns, Name: name}, true
+	return entityKey{Type: eType, Env: env, Namespace: ns, Name: name}, true
 }
 
 // serviceNamespaceKey refers to the OTEL service.namespace, which is not tied to any Kubernetes namespace
-func serviceNamespaceKey(ns string) entityKey {
-	return entityKey{Type: typeServiceNamespace, Name: ns}
+func serviceNamespaceKey(env, ns string) entityKey {
+	return entityKey{Type: typeServiceNamespace, Env: env, Name: ns}
 }
 
-func serviceName(uid svc.UID) string {
-	if uid.Namespace == "" {
-		return uid.Name
+// Resource attributes that define the deployment environment, in order of preference.
+// This is the same criteria that Asserts follows to set the asserts_env label of the OTEL metrics.
+var environmentAttrs = []attr.Name{"deployment.environment.name", "deployment.environment"}
+
+// environmentFrom returns the deployment environment from the resource attributes, or the
+// default environment if they do not define it
+func environmentFrom(resourceAttrs map[attr.Name]string, defaultEnv string) string {
+	for _, name := range environmentAttrs {
+		if env := resourceAttrs[name]; env != "" {
+			return env
+		}
 	}
-	return uid.Namespace + "/" + uid.Name
+	return defaultEnv
+}
+
+// podResourceAttributes returns the OTEL resource attributes of a Pod, with the same precedence as the
+// Kubernetes metadata decorator: OTEL_RESOURCE_ATTRIBUTES in the containers, then resource.opentelemetry.io/ annotations
+func podResourceAttributes(meta *informer.ObjectMeta) map[attr.Name]string {
+	resAttrs := map[attr.Name]string{}
+	for name, value := range meta.Annotations {
+		if propertyName, ok := strings.CutPrefix(name, kube.ResourceAttributesPrefix); ok {
+			resAttrs[attr.Name(propertyName)] = value
+		}
+	}
+	for _, cnt := range meta.GetPod().GetContainers() {
+		attributes.ParseOTELResourceVariable(cnt.Env[kube.EnvResourceAttributes], func(k, v string) {
+			if v != "" && !strings.HasPrefix(v, "$") {
+				resAttrs[attr.Name(k)] = v
+			}
+		})
+	}
+	return resAttrs
+}
+
+// serviceKey identifies a Service by its OTEL service.name and its namespace, which is submitted
+// as the "namespace" scope key: the Kubernetes namespace or, out of Kubernetes, the OTEL service.namespace.
+// The name does not include the namespace, as the Knowledge Graph already shows the namespace
+// from the scope (e.g. a "tapas/tapas-backend" name would be shown as "tapas/tapas/tapas-backend").
+func serviceKey(si *serviceInfo) entityKey {
+	ns := si.kubeNs
+	if ns == "" {
+		ns = si.uid.Namespace
+	}
+	return entityKey{Type: typeService, Env: si.env, Namespace: ns, Name: si.uid.Name}
 }
 
 // processName uses the service instance ID of the process, which is unique per process
@@ -244,8 +287,15 @@ func processName(instance, hostID string, pid app.PID) string {
 	return hostID + "/" + strconv.Itoa(int(pid))
 }
 
+// podRef identifies a Pod in the Kubernetes informer
+type podRef struct {
+	namespace string
+	name      string
+}
+
 // podInfo is the information about a Kubernetes Pod, as received from the Kubernetes informer
 type podInfo struct {
+	env       string
 	namespace string
 	name      string
 	uid       string
@@ -259,8 +309,10 @@ type podInfo struct {
 	workloads []entityKey
 }
 
-func podInfoFrom(meta *informer.ObjectMeta) *podInfo {
+func podInfoFrom(meta *informer.ObjectMeta, defaultEnv string) *podInfo {
+	env := environmentFrom(podResourceAttributes(meta), defaultEnv)
 	pi := &podInfo{
+		env:       env,
 		namespace: meta.Namespace,
 		name:      meta.Name,
 		uid:       meta.Pod.Uid,
@@ -269,7 +321,7 @@ func podInfoFrom(meta *informer.ObjectMeta) *podInfo {
 	// the informer reports the owners from the direct owner to the top-level owner,
 	// e.g. ReplicaSet, Deployment
 	for _, owner := range meta.Pod.Owners {
-		if wk, ok := workloadKey(meta.Namespace, owner.Kind, owner.Name); ok {
+		if wk, ok := workloadKey(env, meta.Namespace, owner.Kind, owner.Name); ok {
 			pi.workloads = append(pi.workloads, wk)
 		}
 	}
@@ -280,28 +332,45 @@ func podInfoFrom(meta *informer.ObjectMeta) *podInfo {
 	return pi
 }
 
+func (pi *podInfo) key() entityKey {
+	return entityKey{Type: typePod, Env: pi.env, Namespace: pi.namespace, Name: pi.name}
+}
+
+// topWorkload returns the top-level workload entity that owns the Pod, if any
+func (pi *podInfo) topWorkload() (entityKey, bool) {
+	if len(pi.workloads) == 0 {
+		return entityKey{}, false
+	}
+	return pi.workloads[len(pi.workloads)-1], true
+}
+
 // serviceInfo is the information about an instrumented service, as received from
 // the process discovery events and the instrumented spans
 type serviceInfo struct {
 	uid      svc.UID
+	env      string
 	language string
 	kubeNs   string
 	kubePod  string
-	// kind and name of the top-level owner of the Pod. If the Pod does not have any owner,
-	// the kind is "Pod" and the name is the Pod name.
-	kubeOwnerKind string
-	kubeOwnerName string
 }
 
-func serviceInfoFrom(attrs *svc.Attrs) serviceInfo {
+func serviceInfoFrom(attrs *svc.Attrs, defaultEnv string) serviceInfo {
 	return serviceInfo{
-		uid:           attrs.UID,
-		language:      attrs.SDKLanguage.String(),
-		kubeNs:        attrs.Metadata[attr.K8sNamespaceName],
-		kubePod:       attrs.Metadata[attr.K8sPodName],
-		kubeOwnerKind: attrs.Metadata[attr.K8sKind],
-		kubeOwnerName: attrs.Metadata[attr.K8sOwnerName],
+		uid:      attrs.UID,
+		env:      environmentFrom(attrs.Metadata, defaultEnv),
+		language: attrs.SDKLanguage.String(),
+		kubeNs:   attrs.Metadata[attr.K8sNamespaceName],
+		kubePod:  attrs.Metadata[attr.K8sPodName],
 	}
+}
+
+// pod returns the Pod where the service runs, if it is known by the Kubernetes informer
+func (si *serviceInfo) pod(pods map[podRef]*podInfo) (*podInfo, bool) {
+	if si.kubeNs == "" || si.kubePod == "" {
+		return nil, false
+	}
+	pod, ok := pods[podRef{namespace: si.kubeNs, name: si.kubePod}]
+	return pod, ok
 }
 
 // processInfo is the information about an instrumented process, as received from the process discovery events
@@ -326,7 +395,7 @@ func (g *graph) addPod(pod *podInfo) {
 		podProps["workload"] = pod.topOwnerName
 		podProps["workload_type"] = pod.topOwnerKind
 	}
-	child := g.addEntity(podKey(pod.namespace, pod.name), podProps)
+	child := g.addEntity(pod.key(), podProps)
 	for _, wk := range pod.workloads {
 		g.addEntity(wk, nil)
 		g.addRelation(relControls, wk, child)
@@ -335,8 +404,9 @@ func (g *graph) addPod(pod *podInfo) {
 }
 
 // addService adds the Service entity, its OTEL namespace and its Kubernetes relations.
+// The pods argument contains the Pods known by the Kubernetes informer.
 // It returns false if the service does not have enough information to be added.
-func (g *graph) addService(si *serviceInfo) (entityKey, bool) {
+func (g *graph) addService(si *serviceInfo, pods map[podRef]*podInfo) (entityKey, bool) {
 	if si.uid.Name == "" {
 		return entityKey{}, false
 	}
@@ -347,24 +417,23 @@ func (g *graph) addService(si *serviceInfo) (entityKey, bool) {
 	if si.language != "" {
 		props["telemetry_sdk_language"] = si.language
 	}
-	svcKey := g.addEntity(entityKey{Type: typeService, Namespace: si.kubeNs, Name: serviceName(si.uid)}, props)
+	svcKey := g.addEntity(serviceKey(si), props)
 	if si.uid.Namespace != "" {
-		nsKey := g.addEntity(serviceNamespaceKey(si.uid.Namespace), nil)
+		nsKey := g.addEntity(serviceNamespaceKey(si.env, si.uid.Namespace), nil)
 		g.addRelation(relHasMember, nsKey, svcKey)
 	}
-	// The Kubernetes entities are added from the informer. Here we just add the relations,
-	// that will be pruned later if the Kubernetes entities are not known
-	if si.kubeNs != "" && si.kubePod != "" {
-		g.addRelation(relHosts, podKey(si.kubeNs, si.kubePod), svcKey)
-		// for standalone Pods, the top-level owner kind is "Pod", so no workload is added
-		if wk, ok := workloadKey(si.kubeNs, si.kubeOwnerKind, si.kubeOwnerName); ok {
+	// The Kubernetes entities are added from the informer, so we take their identity from there,
+	// as their environment might differ from the service environment.
+	if pod, ok := si.pod(pods); ok {
+		g.addRelation(relHosts, pod.key(), svcKey)
+		if wk, ok := pod.topWorkload(); ok {
 			g.addRelation(relHosts, wk, svcKey)
 		}
 	}
 	return svcKey, true
 }
 
-func (g *graph) addProcess(hostID string, proc *processInfo) entityKey {
+func (g *graph) addProcess(hostID string, proc *processInfo, pods map[podRef]*podInfo) entityKey {
 	props := properties{"pid": int64(proc.pid)}
 	if proc.ppid != 0 {
 		props["ppid"] = int64(proc.ppid)
@@ -383,14 +452,14 @@ func (g *graph) addProcess(hostID string, proc *processInfo) entityKey {
 	}
 	procKey := g.addEntity(entityKey{
 		Type:      typeProcess,
+		Env:       proc.service.env,
 		Namespace: proc.service.kubeNs,
 		Name:      processName(proc.service.uid.Instance, hostID, proc.pid),
 	}, props)
-	// as for the services, the relation is pruned later if the Pod is not known by the informer
-	if proc.service.kubeNs != "" && proc.service.kubePod != "" {
-		g.addRelation(relHosts, podKey(proc.service.kubeNs, proc.service.kubePod), procKey)
+	if pod, ok := proc.service.pod(pods); ok {
+		g.addRelation(relHosts, pod.key(), procKey)
 	}
-	if svcKey, ok := g.addService(&proc.service); ok {
+	if svcKey, ok := g.addService(&proc.service, pods); ok {
 		g.addRelation(relExecutes, procKey, svcKey)
 	}
 	return procKey

@@ -3,9 +3,11 @@ package sem
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -73,10 +75,12 @@ func processEvent(eventType exec.ProcessEventType, pid int, attrs svc.Attrs) *ex
 func relationsOf(g *graph) []relationKey { return g.sortedRelations() }
 
 // ek returns the key of an entity that is not in a Kubernetes namespace
-func ek(t, n string) entityKey { return entityKey{Type: t, Name: n} }
+func ek(t, n string) entityKey { return entityKey{Type: t, Env: defaultEnvironment, Name: n} }
 
 // ekn returns the key of an entity in a Kubernetes namespace
-func ekn(t, ns, n string) entityKey { return entityKey{Type: t, Namespace: ns, Name: n} }
+func ekn(t, ns, n string) entityKey {
+	return entityKey{Type: t, Env: defaultEnvironment, Namespace: ns, Name: n}
+}
 
 func TestBuildGraph(t *testing.T) {
 	se := newSemanticExporter(&testCfg, &fakeWriter{}, testHost)
@@ -92,7 +96,7 @@ func TestBuildGraph(t *testing.T) {
 	deploy := ekn(typeDeployment, "default", "frontend")
 	pod := ekn(typePod, "default", "frontend-1234-abcd")
 	proc := ekn(typeProcess, "default", "default.frontend-1234-abcd.frontend")
-	service := ekn(typeService, "default", "shop/frontend")
+	service := ekn(typeService, "default", "frontend")
 	// the OTEL service namespace is not tied to any Kubernetes namespace
 	serviceNs := ek(typeServiceNamespace, "shop")
 	assert.Equal(t, []entityKey{deploy, pod, proc, service, serviceNs}, g.sortedEntities())
@@ -193,6 +197,77 @@ func TestBuildGraph_WorkloadExecutesService(t *testing.T) {
 	assert.Equal(t, properties{"uid": "uid-standalone", "node": "node1"}, g.entities[k(typePod, "standalone")])
 }
 
+func TestBuildGraph_Environment(t *testing.T) {
+	cfg := (&SemanticConfig{Environment: "staging"}).withDefaults()
+	se := newSemanticExporter(&cfg, &fakeWriter{}, testHost)
+
+	// the environment of a pod is taken from the resource attributes in the annotations and
+	// the containers OTEL_RESOURCE_ATTRIBUTES, which takes precedence
+	annotated := podEvent(informer.EventType_CREATED, "default", "annotated-abc", deploymentOwners("annotated")...)
+	annotated.Resource.Annotations = map[string]string{"resource.opentelemetry.io/deployment.environment": "qa"}
+	require.NoError(t, se.On(annotated))
+	withEnv := podEvent(informer.EventType_CREATED, "default", "env-abc")
+	withEnv.Resource.Annotations = map[string]string{"resource.opentelemetry.io/deployment.environment.name": "qa"}
+	withEnv.Resource.Pod.Containers = []*informer.ContainerInfo{{Name: "c", Env: map[string]string{
+		"OTEL_RESOURCE_ATTRIBUTES": "foo=bar,deployment.environment.name=prod",
+	}}}
+	require.NoError(t, se.On(withEnv))
+	// pods without environment take the configured one
+	require.NoError(t, se.On(podEvent(informer.EventType_CREATED, "default", "plain-abc")))
+
+	// the service environment is taken from its own resource attributes. It can differ from the pod's one,
+	// so the relation must refer to the pod as known by the informer
+	attrs := kubeService("annotated", "", "default", "annotated-abc", "annotated")
+	attrs.Metadata["deployment.environment.name"] = "prod"
+	plain := kubeService("plain", "", "default", "plain-abc", "")
+	se.onSpans([]request.Span{{Service: attrs}, {Service: plain}})
+
+	g := se.buildGraph()
+	key := func(t, env, n string) entityKey { return entityKey{Type: t, Env: env, Namespace: "default", Name: n} }
+	assert.Equal(t, []entityKey{
+		key(typeDeployment, "qa", "annotated"),
+		key(typePod, "prod", "env-abc"),
+		key(typePod, "qa", "annotated-abc"),
+		key(typePod, "staging", "plain-abc"),
+		key(typeService, "prod", "annotated"),
+		key(typeService, "staging", "plain"),
+	}, g.sortedEntities())
+	assert.Equal(t, []relationKey{
+		{Type: relControls, From: key(typeDeployment, "qa", "annotated"), To: key(typePod, "qa", "annotated-abc")},
+		{Type: relHosts, From: key(typeDeployment, "qa", "annotated"), To: key(typeService, "prod", "annotated")},
+		{Type: relHosts, From: key(typePod, "qa", "annotated-abc"), To: key(typeService, "prod", "annotated")},
+		{Type: relHosts, From: key(typePod, "staging", "plain-abc"), To: key(typeService, "staging", "plain")},
+	}, relationsOf(g))
+}
+
+func TestBuildGraph_ServiceNames(t *testing.T) {
+	se := newSemanticExporter(&testCfg, &fakeWriter{}, testHost)
+	require.NoError(t, se.On(podEvent(informer.EventType_CREATED, "tapas", "tapas-backend-abc", deploymentOwners("tapas-backend")...)))
+	se.onSpans([]request.Span{
+		// in Kubernetes, the OTEL service namespace defaults to the Kubernetes namespace. The name
+		// must not include the namespace, which is already in the scope
+		{Service: kubeService("tapas-backend", "tapas", "tapas", "tapas-backend-abc", "tapas-backend")},
+		// out of Kubernetes, the OTEL service namespace is the namespace scope key
+		{Service: svc.Attrs{UID: svc.UID{Name: "api", Namespace: "shop"}}},
+		{Service: svc.Attrs{UID: svc.UID{Name: "api", Namespace: "billing"}}},
+		{Service: svc.Attrs{UID: svc.UID{Name: "api"}}},
+	})
+
+	g := se.buildGraph()
+	var services []entityKey
+	for _, e := range g.sortedEntities() {
+		if e.Type == typeService {
+			services = append(services, e)
+		}
+	}
+	assert.Equal(t, []entityKey{
+		ek(typeService, "api"),
+		ekn(typeService, "billing", "api"),
+		ekn(typeService, "shop", "api"),
+		ekn(typeService, "tapas", "tapas-backend"),
+	}, services)
+}
+
 func TestBuildGraph_ProcessNames(t *testing.T) {
 	se := newSemanticExporter(&testCfg, &fakeWriter{}, testHost)
 	// two processes from the same executable and service, outside Kubernetes
@@ -287,7 +362,7 @@ func TestFlush_DeletesOnlyVolatileEntities(t *testing.T) {
 	require.Len(t, fw.written, 2)
 	pod := ekn(typePod, "default", "frontend-1234-abcd")
 	proc := ekn(typeProcess, "default", "default.frontend-1234-abcd.frontend")
-	service := ekn(typeService, "default", "shop/frontend")
+	service := ekn(typeService, "default", "frontend")
 	// Deployment, Service and ServiceNamespace are not explicitly deleted: they will expire by TTL
 	assert.Equal(t, []entityKey{pod, proc}, fw.deletedEntities)
 	assert.Equal(t, []relationKey{
@@ -346,12 +421,16 @@ func TestToKGProperties_SkipsReservedKeys(t *testing.T) {
 }
 
 func TestKnowledgeGraph_ScopeFor(t *testing.T) {
-	kg := &knowledgeGraph{scope: map[string]string{"env": "demo"}}
-	assert.Equal(t, map[string]string{"env": "demo"}, kg.scopeFor(ek(typeServiceNamespace, "otelns")))
-	assert.Equal(t, map[string]string{"env": "demo", "namespace": "ns"},
-		kg.scopeFor(ekn(typePod, "ns", "pod")))
+	kg := &knowledgeGraph{scope: commonScope(&SemanticConfig{Site: "eu-west"})}
+	assert.Equal(t, map[string]string{"site": "eu-west", "env": "unknown"},
+		kg.scopeFor(ek(typeServiceNamespace, "otelns")))
+	assert.Equal(t, map[string]string{"site": "eu-west", "env": "prod", "namespace": "ns"},
+		kg.scopeFor(entityKey{Type: typePod, Env: "prod", Namespace: "ns", Name: "pod"}))
 	// the common scope is not modified
-	assert.Equal(t, map[string]string{"env": "demo"}, kg.scope)
+	assert.Equal(t, map[string]string{"site": "eu-west"}, kg.scope)
+
+	// no site by default
+	assert.Empty(t, commonScope(&SemanticConfig{}))
 }
 
 func TestKnowledgeGraph_WriteGraphBatches(t *testing.T) {
@@ -380,12 +459,12 @@ func TestKnowledgeGraph_WriteGraphBatches(t *testing.T) {
 	g := newGraph()
 	for i := range maxBatchItems + 10 {
 		g.addPod(&podInfo{
-			namespace: "ns", name: fmt.Sprintf("pod%d", i), uid: fmt.Sprintf("uid%d", i),
-			workloads: []entityKey{ekn(typeDeployment, "ns", fmt.Sprintf("deploy%d", i))},
+			env: "prod", namespace: "ns", name: fmt.Sprintf("pod%d", i), uid: fmt.Sprintf("uid%d", i),
+			workloads: []entityKey{{Type: typeDeployment, Env: "prod", Namespace: "ns", Name: fmt.Sprintf("deploy%d", i)}},
 		})
 	}
 	// an entity out of any Kubernetes namespace
-	g.addEntity(serviceNamespaceKey("otelns"), nil)
+	g.addEntity(serviceNamespaceKey("prod", "otelns"), nil)
 	g.pruneDanglingRelations()
 	require.NoError(t, kg.writeGraph(t.Context(), g))
 
@@ -408,27 +487,135 @@ func TestKnowledgeGraph_WriteGraphBatches(t *testing.T) {
 	assert.Equal(t, "beyla", deploy.Domain)
 	assert.Equal(t, typeDeployment, deploy.Type)
 	assert.Equal(t, "deploy0", deploy.Name)
-	assert.Equal(t, map[string]string{"env": "demo", "namespace": "ns"}, deploy.Scope)
+	assert.Equal(t, map[string]string{"env": "prod", "namespace": "ns"}, deploy.Scope)
 	assert.Equal(t, int64(90), deploy.TTLSeconds)
 	assert.Empty(t, deploy.Properties)
 
 	pod := requests[1].Entities[10]
 	assert.Equal(t, typePod, pod.Type)
 	assert.Equal(t, "pod0", pod.Name)
-	assert.Equal(t, map[string]string{"env": "demo", "namespace": "ns"}, pod.Scope)
+	assert.Equal(t, map[string]string{"env": "prod", "namespace": "ns"}, pod.Scope)
 	assert.Equal(t, map[string]any{"uid": "uid0"}, pod.Properties)
 
 	serviceNs := requests[2].Entities[20]
 	assert.Equal(t, typeServiceNamespace, serviceNs.Type)
 	assert.Equal(t, "otelns", serviceNs.Name)
-	assert.Equal(t, map[string]string{"env": "demo"}, serviceNs.Scope)
+	assert.Equal(t, map[string]string{"env": "prod"}, serviceNs.Scope)
 
 	rel := requests[3].Relationships[0]
 	assert.Equal(t, relControls, rel.Type)
 	assert.Equal(t, graphRef{Domain: "beyla", Type: typeDeployment, Name: "deploy0",
-		Scope: map[string]string{"env": "demo", "namespace": "ns"}}, rel.From)
+		Scope: map[string]string{"env": "prod", "namespace": "ns"}}, rel.From)
 	assert.Equal(t, graphRef{Domain: "beyla", Type: typePod, Name: "pod0",
-		Scope: map[string]string{"env": "demo", "namespace": "ns"}}, rel.To)
+		Scope: map[string]string{"env": "prod", "namespace": "ns"}}, rel.To)
+}
+
+func TestKnowledgeGraph_TelemetryOwnedEntities(t *testing.T) {
+	var mt sync.Mutex
+	var requests []graphRequest
+	var otherRequests []string
+	// entities that already exist in the telemetry domain, by name
+	telemetryEntities := map[string]bool{"tapas-backend": true}
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		mt.Lock()
+		defer mt.Unlock()
+		rw.Header().Set("Content-Type", "application/json")
+		if !strings.HasSuffix(req.URL.Path, "/graph") {
+			otherRequests = append(otherRequests, req.Method+" "+req.URL.Path)
+			rw.WriteHeader(http.StatusNoContent)
+			return
+		}
+		var gr graphRequest
+		assert.NoError(t, json.NewDecoder(req.Body).Decode(&gr))
+		requests = append(requests, gr)
+		for i, e := range gr.Entities {
+			if telemetryEntities[e.Name] {
+				rw.WriteHeader(http.StatusConflict)
+				_, _ = fmt.Fprintf(rw, `{"status":"CONFLICT","message":"entities[%d]: an entity with this (type, name, scope) exists in the default domain"}`, i)
+				return
+			}
+		}
+		_, _ = rw.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	kg, err := createKnowledgeGraph((&SemanticConfig{
+		CellGatewayURL: srv.URL, StackID: "1234", GrafanaGCOMToken: "test-token",
+	}).withDefaults())
+	require.NoError(t, err)
+	kg.client.GetConfig().HTTPClient = srv.Client()
+	now := time.Unix(1000, 0)
+	kg.clock = func() time.Time { return now }
+
+	g := newGraph()
+	deploy := g.addEntity(ekn(typeDeployment, "tapas", "tapas-db"), nil)
+	service := g.addEntity(ekn(typeService, "tapas", "tapas-backend"), properties{"otel_service": "tapas-backend"})
+	g.addRelation(relHosts, deploy, service)
+
+	names := func(gr graphRequest) []string {
+		var n []string
+		for _, e := range gr.Entities {
+			n = append(n, e.Name)
+		}
+		return n
+	}
+
+	// the conflicting entity is removed from the batch, which is retried
+	require.NoError(t, kg.writeGraph(t.Context(), g))
+	require.Len(t, requests, 3)
+	assert.Equal(t, []string{"tapas-db", "tapas-backend"}, names(requests[0]))
+	assert.Equal(t, []string{"tapas-db"}, names(requests[1]))
+	// the relationship refers to the telemetry domain entity
+	require.Len(t, requests[2].Relationships, 1)
+	rel := requests[2].Relationships[0]
+	assert.Equal(t, graphRef{Domain: "beyla", Type: typeDeployment, Name: "tapas-db",
+		Scope: map[string]string{"env": "unknown", "namespace": "tapas"}}, rel.From)
+	assert.Equal(t, graphRef{Domain: "metrics", Type: typeService, Name: "tapas-backend",
+		Scope: map[string]string{"env": "unknown", "namespace": "tapas"}}, rel.To)
+
+	// in the next submissions, the telemetry entity is not written anymore
+	requests = nil
+	require.NoError(t, kg.writeGraph(t.Context(), g))
+	require.Len(t, requests, 2)
+	assert.Equal(t, []string{"tapas-db"}, names(requests[0]))
+	assert.Equal(t, "metrics", requests[1].Relationships[0].To.Domain)
+
+	// after some time, Beyla checks again whether the entity is still in the telemetry domain
+	now = now.Add(telemetryOwnershipRecheck + time.Second)
+	requests = nil
+	require.NoError(t, kg.writeGraph(t.Context(), g))
+	require.Len(t, requests, 3)
+	assert.Equal(t, []string{"tapas-db", "tapas-backend"}, names(requests[0]))
+
+	// if it does not exist anymore in the telemetry domain, Beyla writes it in its own domain
+	mt.Lock()
+	delete(telemetryEntities, "tapas-backend")
+	mt.Unlock()
+	now = now.Add(telemetryOwnershipRecheck + time.Second)
+	requests = nil
+	require.NoError(t, kg.writeGraph(t.Context(), g))
+	require.Len(t, requests, 2)
+	assert.Equal(t, []string{"tapas-db", "tapas-backend"}, names(requests[0]))
+	assert.Equal(t, "beyla", requests[1].Relationships[0].To.Domain)
+
+	// Beyla never deletes the telemetry entities
+	now = now.Add(-telemetryOwnershipRecheck)
+	kg.telemetryOwned[service] = now
+	require.NoError(t, kg.deleteEntity(t.Context(), service))
+	assert.Empty(t, otherRequests)
+	require.NoError(t, kg.deleteEntity(t.Context(), deploy))
+	assert.Len(t, otherRequests, 1)
+}
+
+func TestTelemetryConflictIndex(t *testing.T) {
+	idx, ok := telemetryConflictIndexFromMessage(
+		"entities[30]: an entity with this (type, name, scope) exists in the default domain")
+	assert.True(t, ok)
+	assert.Equal(t, 30, idx)
+	_, ok = telemetryConflictIndexFromMessage("graph writes are paused for a graph migration")
+	assert.False(t, ok)
+	_, ok = telemetryConflictIndex(errors.New("connection refused"))
+	assert.False(t, ok)
 }
 
 type graphRequest struct {
@@ -488,9 +675,9 @@ func (f *fakeWriter) deleteEntity(_ context.Context, e entityKey) error {
 	return nil
 }
 
-func (f *fakeWriter) deleteRelationship(_ context.Context, r relationKey) error {
+func (f *fakeWriter) deleteRelationship(_ context.Context, r *relationKey) error {
 	f.mt.Lock()
 	defer f.mt.Unlock()
-	f.deletedRelations = append(f.deletedRelations, r)
+	f.deletedRelations = append(f.deletedRelations, *r)
 	return nil
 }

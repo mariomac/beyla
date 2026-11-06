@@ -24,6 +24,8 @@ import (
 
 const (
 	defaultDomain          = "beyla"
+	defaultEnvironment     = "unknown"
+	defaultTelemetryDomain = "metrics"
 	defaultRefreshInterval = 30 * time.Second
 	// default TTL, as a multiple of the refresh interval, so an entity is not expired
 	// if a single refresh fails
@@ -51,6 +53,23 @@ type SemanticConfig struct {
 	// this time, the Knowledge Graph expires it. It is also used to forget the services
 	// that haven't been seen in any span for this time. Defaults to 3 times the RefreshInterval.
 	TTL time.Duration `yaml:"ttl" env:"GRAFANA_CELL_TTL"`
+
+	// Environment is submitted as the "env" scope key of the entities that do not define the
+	// deployment.environment.name (or deprecated deployment.environment) resource attribute,
+	// e.g. via OTEL_RESOURCE_ATTRIBUTES or the resource.opentelemetry.io/ Pod annotations.
+	// It should match the asserts_env label of the metrics, to allow correlating the entities
+	// with the Asserts telemetry entities. Defaults to "unknown", as Asserts does for OTEL metrics.
+	Environment string `yaml:"environment" env:"GRAFANA_CELL_ENVIRONMENT"`
+
+	// Site is submitted as the "site" scope key of all the entities, if set.
+	// It should match the asserts_site label of the metrics (e.g. the region).
+	Site string `yaml:"site" env:"GRAFANA_CELL_SITE"`
+
+	// TelemetryDomain is the Knowledge Graph domain of the entities that are created from the telemetry
+	// (e.g. by the Asserts model rules). Beyla can't write entities there, so if an entity already
+	// exists in that domain, Beyla doesn't write its own entity but refers to the existing one from its
+	// relationships. Defaults to "metrics".
+	TelemetryDomain string `yaml:"telemetry_domain" env:"GRAFANA_CELL_TELEMETRY_DOMAIN"`
 }
 
 func (sc *SemanticConfig) Enabled() bool {
@@ -67,6 +86,12 @@ func (sc *SemanticConfig) withDefaults() SemanticConfig {
 	}
 	if cfg.TTL <= 0 {
 		cfg.TTL = defaultTTLIntervals * cfg.RefreshInterval
+	}
+	if cfg.Environment == "" {
+		cfg.Environment = defaultEnvironment
+	}
+	if cfg.TelemetryDomain == "" {
+		cfg.TelemetryDomain = defaultTelemetryDomain
 	}
 	return cfg
 }
@@ -127,7 +152,7 @@ func hostID(ctxInfo *global.ContextInfo) string {
 type graphWriter interface {
 	writeGraph(ctx context.Context, g *graph) error
 	deleteEntity(ctx context.Context, e entityKey) error
-	deleteRelationship(ctx context.Context, r relationKey) error
+	deleteRelationship(ctx context.Context, r *relationKey) error
 }
 
 type seenService struct {
@@ -149,7 +174,7 @@ type semanticExporter struct {
 
 	mut sync.Mutex
 	// pods by namespace and name
-	pods map[entityKey]*podInfo
+	pods map[podRef]*podInfo
 	// instrumented processes by PID
 	processes map[app.PID]*processInfo
 	// services seen in the spans, by service instance
@@ -167,7 +192,7 @@ func newSemanticExporter(cfg *SemanticConfig, kg graphWriter, hostID string) *se
 		kg:        kg,
 		hostID:    hostID,
 		clock:     time.Now,
-		pods:      map[entityKey]*podInfo{},
+		pods:      map[podRef]*podInfo{},
 		processes: map[app.PID]*processInfo{},
 		services:  map[svc.UID]*seenService{},
 	}
@@ -230,7 +255,7 @@ func (se *semanticExporter) On(event *informer.Event) error {
 	if meta == nil || meta.Pod == nil || meta.Kind != "Pod" {
 		return nil
 	}
-	key := podKey(meta.Namespace, meta.Name)
+	key := podRef{namespace: meta.Namespace, name: meta.Name}
 	se.mut.Lock()
 	defer se.mut.Unlock()
 	switch event.Type {
@@ -238,7 +263,7 @@ func (se *semanticExporter) On(event *informer.Event) error {
 		if meta.Pod.Finished {
 			delete(se.pods, key)
 		} else {
-			se.pods[key] = podInfoFrom(meta)
+			se.pods[key] = podInfoFrom(meta, se.cfg.Environment)
 		}
 	case informer.EventType_DELETED:
 		delete(se.pods, key)
@@ -261,7 +286,7 @@ func (se *semanticExporter) onProcessEvent(pe *exec.ProcessEvent) {
 			ppid:     pe.File.Ppid(),
 			exePath:  pe.File.CmdExePath(),
 			exeName:  pe.File.ExecutableName(),
-			service:  serviceInfoFrom(&attrs),
+			service:  serviceInfoFrom(&attrs, se.cfg.Environment),
 			hostName: attrs.HostName,
 		}
 	case exec.ProcessEventTerminated:
@@ -286,7 +311,7 @@ func (se *semanticExporter) onSpans(spans []request.Span) {
 			continue
 		}
 		se.services[s.UID] = &seenService{
-			info:     serviceInfoFrom(s),
+			info:     serviceInfoFrom(s, se.cfg.Environment),
 			pid:      s.ProcPID,
 			lastSeen: now,
 		}
@@ -306,14 +331,14 @@ func (se *semanticExporter) buildGraph() *graph {
 	}
 	procKeys := make(map[app.PID]entityKey, len(se.processes))
 	for pid, proc := range se.processes {
-		procKeys[pid] = g.addProcess(se.hostID, proc)
+		procKeys[pid] = g.addProcess(se.hostID, proc, se.pods)
 	}
 	for uid, seen := range se.services {
 		if now.Sub(seen.lastSeen) > se.cfg.TTL {
 			delete(se.services, uid)
 			continue
 		}
-		svcKey, ok := g.addService(&seen.info)
+		svcKey, ok := g.addService(&seen.info, se.pods)
 		if !ok {
 			continue
 		}
@@ -339,8 +364,8 @@ func (se *semanticExporter) flush(ctx context.Context) {
 		se.log.Warn("can't submit graph to the Knowledge Graph. Will retry in the next refresh", "error", err)
 	}
 	// relations must be removed before their entities
-	for _, r := range removedRelations {
-		if err := se.kg.deleteRelationship(ctx, r); err != nil {
+	for i := range removedRelations {
+		if err := se.kg.deleteRelationship(ctx, &removedRelations[i]); err != nil {
 			se.log.Debug("can't delete relationship. It will expire by TTL", "error", err)
 		}
 	}
