@@ -77,7 +77,7 @@ func elog() *slog.Logger {
 
 // SemanticExporter creates a pipeline node that listens for:
 //   - Kubernetes Pod events (from the Kubernetes informer, if enabled), to create
-//     KubePod, KubeDeployment and KubeNamespace entities.
+//     Pod and workload (Deployment, StatefulSet, DaemonSet, Job, CronJob) entities.
 //   - Instrumented process events, to create Process entities and the Services they execute.
 //   - Decorated application spans, to keep track of the active Services and where they run.
 //

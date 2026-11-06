@@ -89,8 +89,8 @@ func TestBuildGraph(t *testing.T) {
 
 	g := se.buildGraph()
 
-	deploy := ekn(typeKubeDeployment, "default", "frontend")
-	pod := ekn(typeKubePod, "default", "frontend-1234-abcd")
+	deploy := ekn(typeDeployment, "default", "frontend")
+	pod := ekn(typePod, "default", "frontend-1234-abcd")
 	proc := ekn(typeProcess, "default", "default.frontend-1234-abcd.frontend")
 	service := ekn(typeService, "default", "shop/frontend")
 	// the OTEL service namespace is not tied to any Kubernetes namespace
@@ -98,21 +98,23 @@ func TestBuildGraph(t *testing.T) {
 	assert.Equal(t, []entityKey{deploy, pod, proc, service, serviceNs}, g.sortedEntities())
 
 	assert.Equal(t, []relationKey{
-		{Type: relBelongsTo, From: pod, To: deploy},
-		{Type: relBelongsTo, From: service, To: serviceNs},
-		{Type: relExecutes, From: deploy, To: service},
+		{Type: relControls, From: deploy, To: pod},
 		{Type: relExecutes, From: proc, To: service},
-		{Type: relRunsIn, From: proc, To: pod},
-		{Type: relRunsIn, From: service, To: pod},
+		{Type: relHasMember, From: serviceNs, To: service},
+		{Type: relHosts, From: deploy, To: service},
+		{Type: relHosts, From: pod, To: proc},
+		{Type: relHosts, From: pod, To: service},
 	}, relationsOf(g))
 
 	assert.Equal(t, properties{
-		"pid": int64(33), "ppid": int64(1), "executablePath": "/usr/bin/server", "executableName": "server",
-		"hostId": testHost, "hostName": "frontend-1234-abcd",
+		"pid": int64(33), "ppid": int64(1), "executable_path": "/usr/bin/server", "process_executable_name": "server",
+		"host_id": testHost, "host_name": "frontend-1234-abcd",
 	}, g.entities[proc])
-	assert.Equal(t, properties{"uid": "uid-frontend-1234-abcd", "nodeName": "node1"}, g.entities[pod])
 	assert.Equal(t, properties{
-		"serviceName": "frontend", "serviceNamespace": "shop", "sdkLanguage": "go",
+		"uid": "uid-frontend-1234-abcd", "node": "node1", "workload": "frontend", "workload_type": "Deployment",
+	}, g.entities[pod])
+	assert.Equal(t, properties{
+		"otel_service": "frontend", "otel_namespace": "shop", "telemetry_sdk_language": "go",
 	}, g.entities[service])
 
 	// the Knowledge Graph rejects the whole batch if any property uses a reserved identity key
@@ -137,7 +139,7 @@ func TestBuildGraph_WorkloadExecutesService(t *testing.T) {
 	// a pod owned by a Job, which is owned by a CronJob
 	require.NoError(t, se.On(podEvent(informer.EventType_CREATED, "default", "backup-123-abc",
 		&informer.Owner{Kind: "Job", Name: "backup-123"}, &informer.Owner{Kind: "CronJob", Name: "backup"})))
-	// a pod owned by a non-workload object
+	// a pod owned by a non-workload object: it has no workload entity, but it still hosts the service
 	require.NoError(t, se.On(podEvent(informer.EventType_CREATED, "default", "custom-1",
 		&informer.Owner{Kind: "Rollout", Name: "custom"})))
 	se.onSpans([]request.Span{
@@ -151,37 +153,44 @@ func TestBuildGraph_WorkloadExecutesService(t *testing.T) {
 	g := se.buildGraph()
 	k := func(t, n string) entityKey { return ekn(t, "default", n) }
 	assert.Equal(t, []entityKey{
-		k(typeKubeCronJob, "backup"),
-		k(typeKubeDaemonSet, "agent"),
-		k(typeKubeJob, "backup-123"),
-		k(typeKubePod, "agent-x1"),
-		k(typeKubePod, "backup-123-abc"),
-		k(typeKubePod, "custom-1"),
-		k(typeKubePod, "db-0"),
-		k(typeKubePod, "standalone"),
-		k(typeKubeStatefulSet, "db"),
+		k(typeCronJob, "backup"),
+		k(typeDaemonSet, "agent"),
+		k(typeJob, "backup-123"),
+		k(typePod, "agent-x1"),
+		k(typePod, "backup-123-abc"),
+		k(typePod, "custom-1"),
+		k(typePod, "db-0"),
+		k(typePod, "standalone"),
 		k(typeService, "agent"),
 		k(typeService, "backup"),
 		k(typeService, "custom"),
 		k(typeService, "db"),
 		k(typeService, "standalone"),
+		k(typeStatefulSet, "db"),
 	}, g.sortedEntities())
 	assert.Equal(t, []relationKey{
-		{Type: relBelongsTo, From: k(typeKubeJob, "backup-123"), To: k(typeKubeCronJob, "backup")},
-		{Type: relBelongsTo, From: k(typeKubePod, "agent-x1"), To: k(typeKubeDaemonSet, "agent")},
-		{Type: relBelongsTo, From: k(typeKubePod, "backup-123-abc"), To: k(typeKubeJob, "backup-123")},
-		{Type: relBelongsTo, From: k(typeKubePod, "db-0"), To: k(typeKubeStatefulSet, "db")},
-		// the top-level workload executes the service
-		{Type: relExecutes, From: k(typeKubeCronJob, "backup"), To: k(typeService, "backup")},
-		{Type: relExecutes, From: k(typeKubeDaemonSet, "agent"), To: k(typeService, "agent")},
-		{Type: relExecutes, From: k(typeKubePod, "standalone"), To: k(typeService, "standalone")},
-		{Type: relExecutes, From: k(typeKubeStatefulSet, "db"), To: k(typeService, "db")},
-		// services run in the pods that have an owner
-		{Type: relRunsIn, From: k(typeService, "agent"), To: k(typeKubePod, "agent-x1")},
-		{Type: relRunsIn, From: k(typeService, "backup"), To: k(typeKubePod, "backup-123-abc")},
-		{Type: relRunsIn, From: k(typeService, "custom"), To: k(typeKubePod, "custom-1")},
-		{Type: relRunsIn, From: k(typeService, "db"), To: k(typeKubePod, "db-0")},
+		{Type: relControls, From: k(typeCronJob, "backup"), To: k(typeJob, "backup-123")},
+		{Type: relControls, From: k(typeDaemonSet, "agent"), To: k(typePod, "agent-x1")},
+		{Type: relControls, From: k(typeJob, "backup-123"), To: k(typePod, "backup-123-abc")},
+		{Type: relControls, From: k(typeStatefulSet, "db"), To: k(typePod, "db-0")},
+		// the top-level workload hosts the service
+		{Type: relHosts, From: k(typeCronJob, "backup"), To: k(typeService, "backup")},
+		{Type: relHosts, From: k(typeDaemonSet, "agent"), To: k(typeService, "agent")},
+		// every pod hosts its services
+		{Type: relHosts, From: k(typePod, "agent-x1"), To: k(typeService, "agent")},
+		{Type: relHosts, From: k(typePod, "backup-123-abc"), To: k(typeService, "backup")},
+		{Type: relHosts, From: k(typePod, "custom-1"), To: k(typeService, "custom")},
+		{Type: relHosts, From: k(typePod, "db-0"), To: k(typeService, "db")},
+		{Type: relHosts, From: k(typePod, "standalone"), To: k(typeService, "standalone")},
+		{Type: relHosts, From: k(typeStatefulSet, "db"), To: k(typeService, "db")},
 	}, relationsOf(g))
+
+	// the workload properties refer to the top-level owner, even if it is not a workload entity
+	assert.Equal(t, properties{"uid": "uid-custom-1", "node": "node1", "workload": "custom", "workload_type": "Rollout"},
+		g.entities[k(typePod, "custom-1")])
+	assert.Equal(t, properties{"uid": "uid-backup-123-abc", "node": "node1", "workload": "backup", "workload_type": "CronJob"},
+		g.entities[k(typePod, "backup-123-abc")])
+	assert.Equal(t, properties{"uid": "uid-standalone", "node": "node1"}, g.entities[k(typePod, "standalone")])
 }
 
 func TestBuildGraph_ProcessNames(t *testing.T) {
@@ -234,7 +243,7 @@ func TestBuildGraph_PodWithoutDeployment(t *testing.T) {
 	require.NoError(t, se.On(finished))
 
 	g := se.buildGraph()
-	assert.Equal(t, []entityKey{ekn(typeKubePod, "kube-system", "standalone")}, g.sortedEntities())
+	assert.Equal(t, []entityKey{ekn(typePod, "kube-system", "standalone")}, g.sortedEntities())
 	assert.Empty(t, relationsOf(g))
 }
 
@@ -276,20 +285,20 @@ func TestFlush_DeletesOnlyVolatileEntities(t *testing.T) {
 
 	se.flush(t.Context())
 	require.Len(t, fw.written, 2)
-	pod := ekn(typeKubePod, "default", "frontend-1234-abcd")
+	pod := ekn(typePod, "default", "frontend-1234-abcd")
 	proc := ekn(typeProcess, "default", "default.frontend-1234-abcd.frontend")
 	service := ekn(typeService, "default", "shop/frontend")
 	// Deployment, Service and ServiceNamespace are not explicitly deleted: they will expire by TTL
 	assert.Equal(t, []entityKey{pod, proc}, fw.deletedEntities)
 	assert.Equal(t, []relationKey{
-		{Type: relBelongsTo, From: pod, To: ekn(typeKubeDeployment, "default", "frontend")},
+		{Type: relControls, From: ekn(typeDeployment, "default", "frontend"), To: pod},
 		{Type: relExecutes, From: proc, To: service},
-		{Type: relRunsIn, From: proc, To: pod},
-		{Type: relRunsIn, From: service, To: pod},
+		{Type: relHosts, From: pod, To: proc},
+		{Type: relHosts, From: pod, To: service},
 	}, fw.deletedRelations)
 	// the remaining pod is still submitted
-	assert.Contains(t, fw.written[1].entities, ekn(typeKubePod, "default", "frontend-1234-efgh"))
-	assert.Contains(t, fw.written[1].entities, ekn(typeKubeDeployment, "default", "frontend"))
+	assert.Contains(t, fw.written[1].entities, ekn(typePod, "default", "frontend-1234-efgh"))
+	assert.Contains(t, fw.written[1].entities, ekn(typeDeployment, "default", "frontend"))
 }
 
 func TestRun_ConsumesQueues(t *testing.T) {
@@ -340,7 +349,7 @@ func TestKnowledgeGraph_ScopeFor(t *testing.T) {
 	kg := &knowledgeGraph{scope: map[string]string{"env": "demo"}}
 	assert.Equal(t, map[string]string{"env": "demo"}, kg.scopeFor(ek(typeServiceNamespace, "otelns")))
 	assert.Equal(t, map[string]string{"env": "demo", "namespace": "ns"},
-		kg.scopeFor(ekn(typeKubePod, "ns", "pod")))
+		kg.scopeFor(ekn(typePod, "ns", "pod")))
 	// the common scope is not modified
 	assert.Equal(t, map[string]string{"env": "demo"}, kg.scope)
 }
@@ -372,7 +381,7 @@ func TestKnowledgeGraph_WriteGraphBatches(t *testing.T) {
 	for i := range maxBatchItems + 10 {
 		g.addPod(&podInfo{
 			namespace: "ns", name: fmt.Sprintf("pod%d", i), uid: fmt.Sprintf("uid%d", i),
-			workloads: []entityKey{ekn(typeKubeDeployment, "ns", fmt.Sprintf("deploy%d", i))},
+			workloads: []entityKey{ekn(typeDeployment, "ns", fmt.Sprintf("deploy%d", i))},
 		})
 	}
 	// an entity out of any Kubernetes namespace
@@ -397,14 +406,14 @@ func TestKnowledgeGraph_WriteGraphBatches(t *testing.T) {
 	// entities are sorted by type, namespace and name
 	deploy := requests[0].Entities[0]
 	assert.Equal(t, "beyla", deploy.Domain)
-	assert.Equal(t, typeKubeDeployment, deploy.Type)
+	assert.Equal(t, typeDeployment, deploy.Type)
 	assert.Equal(t, "deploy0", deploy.Name)
 	assert.Equal(t, map[string]string{"env": "demo", "namespace": "ns"}, deploy.Scope)
 	assert.Equal(t, int64(90), deploy.TTLSeconds)
 	assert.Empty(t, deploy.Properties)
 
 	pod := requests[1].Entities[10]
-	assert.Equal(t, typeKubePod, pod.Type)
+	assert.Equal(t, typePod, pod.Type)
 	assert.Equal(t, "pod0", pod.Name)
 	assert.Equal(t, map[string]string{"env": "demo", "namespace": "ns"}, pod.Scope)
 	assert.Equal(t, map[string]any{"uid": "uid0"}, pod.Properties)
@@ -415,10 +424,10 @@ func TestKnowledgeGraph_WriteGraphBatches(t *testing.T) {
 	assert.Equal(t, map[string]string{"env": "demo"}, serviceNs.Scope)
 
 	rel := requests[3].Relationships[0]
-	assert.Equal(t, relBelongsTo, rel.Type)
-	assert.Equal(t, graphRef{Domain: "beyla", Type: typeKubePod, Name: "pod0",
+	assert.Equal(t, relControls, rel.Type)
+	assert.Equal(t, graphRef{Domain: "beyla", Type: typeDeployment, Name: "deploy0",
 		Scope: map[string]string{"env": "demo", "namespace": "ns"}}, rel.From)
-	assert.Equal(t, graphRef{Domain: "beyla", Type: typeKubeDeployment, Name: "deploy0",
+	assert.Equal(t, graphRef{Domain: "beyla", Type: typePod, Name: "pod0",
 		Scope: map[string]string{"env": "demo", "namespace": "ns"}}, rel.To)
 }
 
