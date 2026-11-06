@@ -25,6 +25,7 @@ import (
 	"github.com/grafana/beyla/v3/pkg/export/otel/spanscfg"
 	"github.com/grafana/beyla/v3/pkg/internal/appolly/traces"
 	msg2 "github.com/grafana/beyla/v3/pkg/internal/helpers/msg"
+	"github.com/grafana/beyla/v3/pkg/sem"
 )
 
 func ilog() *slog.Logger {
@@ -71,6 +72,8 @@ func Build(ctx context.Context, config *beyla.Config, ctxInfo *global.ContextInf
 	sigilExportSubpipeline(swi, ctxInfo, config, selectorCfg)
 
 	swi.Add(ProcessMetricsSwarmInstancer(ctxInfo, config, ctxInfo.OverrideAppExportQueue))
+
+	swi.Add(sem.SemanticExporter(ctxInfo, &config.Semantic, ctxInfo.OverrideAppExportQueue, processEventsCh))
 
 	return swi.Instance(ctx)
 }

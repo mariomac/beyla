@@ -42,6 +42,7 @@ import (
 	"github.com/grafana/beyla/v3/pkg/export/otel/spanscfg"
 	maps2 "github.com/grafana/beyla/v3/pkg/internal/helpers/maps"
 	"github.com/grafana/beyla/v3/pkg/internal/infraolly/process"
+	"github.com/grafana/beyla/v3/pkg/sem"
 	servicesextra "github.com/grafana/beyla/v3/pkg/services"
 	"github.com/grafana/beyla/v3/pkg/webhook/configmap"
 )
@@ -117,7 +118,10 @@ type Config struct {
 	Traces       otelcfg.TracesConfig    `yaml:"otel_traces_export"`
 	// Same as the otel_traces_export option, except all environment variables
 	// are prefixed with BEYLA_GRAFANA_AI_
-	SigilExport  otelcfg.TracesConfig       `yaml:"sigil_export" envPrefix:"BEYLA_GRAFANA_AI_"`
+	SigilExport otelcfg.TracesConfig `yaml:"sigil_export" envPrefix:"BEYLA_GRAFANA_AI_"`
+	// Semantic exports the discovered entities (Kubernetes objects, services, processes...)
+	// and their relations to the Grafana Knowledge Graph
+	Semantic     sem.SemanticConfig         `yaml:"semantic_export"`
 	Metrics      perapp.GlobalMetricsConfig `yaml:"metrics"`
 	Prometheus   prom.PrometheusConfig      `yaml:"prometheus_export"`
 	TracePrinter debug.TracePrinter         `yaml:"trace_printer" env:"BEYLA_TRACE_PRINTER"`

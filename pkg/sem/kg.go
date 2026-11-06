@@ -25,8 +25,10 @@ import (
 // - predefined types of relation
 
 const (
-	defaultExpirySeconds int64 = 1 * 60
-	requestTimeout             = 30 * time.Second
+	requestTimeout = 30 * time.Second
+	// maximum number of entities+relationships in a single WriteGraph request
+	// (default value of the kg-write.batch.max-items server property)
+	maxBatchItems = 500
 )
 
 type gatewayConfig struct {
@@ -36,13 +38,14 @@ type gatewayConfig struct {
 }
 
 type knowledgeGraph struct {
-	client    *kgwrite.APIClient
-	gateway   gatewayConfig
-	namespace string
-	stackID   string
-	domain    string
-	scope     map[string]string
-	log       *slog.Logger
+	client     *kgwrite.APIClient
+	gateway    gatewayConfig
+	namespace  string
+	stackID    string
+	domain     string
+	scope      map[string]string
+	ttlSeconds int64
+	log        *slog.Logger
 }
 
 func createKnowledgeGraph(cfg SemanticConfig) (*knowledgeGraph, error) {
@@ -60,64 +63,104 @@ func createKnowledgeGraph(cfg SemanticConfig) (*knowledgeGraph, error) {
 	kgCfg.AddDefaultHeader("Authorization", gateway.AuthorizationHeader)
 
 	return &knowledgeGraph{
-		log:       slog.With("component", "sem.KnowledgeGraph"),
-		client:    kgwrite.NewAPIClient(kgCfg),
-		gateway:   gateway,
-		namespace: namespace,
-		stackID:   strings.TrimSpace(cfg.StackID),
-		domain:    cfg.Domain,
-		scope:     map[string]string{"env": "demo"},
+		log:        slog.With("component", "sem.KnowledgeGraph"),
+		client:     kgwrite.NewAPIClient(kgCfg),
+		gateway:    gateway,
+		namespace:  namespace,
+		stackID:    strings.TrimSpace(cfg.StackID),
+		domain:     cfg.Domain,
+		scope:      map[string]string{"env": "demo"},
+		ttlSeconds: int64(cfg.TTL.Seconds()),
 	}, nil
 }
 
-func (kg *knowledgeGraph) upsertEntity(ctx context.Context, entityType, name string) error {
-	entity := kgwrite.NewEntityWriteRequestDto(kg.domain, entityType, name, defaultExpirySeconds)
-	entity.SetScope(kg.scope)
+// writeGraph upserts all the entities and relationships of the graph. The Knowledge Graph
+// limits the number of items per request, so the graph is split in multiple batches.
+// All the entities are sent before the relationships, as the Knowledge Graph does not create
+// stub entities for unresolved relationship endpoints.
+func (kg *knowledgeGraph) writeGraph(ctx context.Context, g *graph) error {
+	entities := g.sortedEntities()
+	relations := g.sortedRelations()
+	var errs []error
+	batch := kgwrite.GraphWriteRequestDto{}
+	items := 0
+	send := func() {
+		if items == 0 {
+			return
+		}
+		if err := kg.writeBatch(ctx, &batch); err != nil {
+			errs = append(errs, err)
+		}
+		batch = kgwrite.GraphWriteRequestDto{}
+		items = 0
+	}
+	for _, e := range entities {
+		dto := kgwrite.NewEntityWriteRequestDto(kg.domain, e.Type, e.Name, kg.ttlSeconds)
+		dto.SetScope(kg.scope)
+		if props := g.entities[e]; len(props) > 0 {
+			dto.SetProperties(toKGProperties(props))
+		}
+		batch.Entities = append(batch.Entities, *dto)
+		if items++; items >= maxBatchItems {
+			send()
+		}
+	}
+	// flushing pending entities before starting sending relations
+	send()
+	for _, r := range relations {
+		from := kgwrite.NewEntityRefDto(kg.domain, r.From.Type, r.From.Name)
+		to := kgwrite.NewEntityRefDto(kg.domain, r.To.Type, r.To.Name)
+		from.SetScope(kg.scope)
+		to.SetScope(kg.scope)
+		batch.Relationships = append(batch.Relationships,
+			*kgwrite.NewRelationshipWriteRequestDto(kg.domain, r.Type, *from, *to, kg.ttlSeconds))
+		if items++; items >= maxBatchItems {
+			send()
+		}
+	}
+	send()
+	return errors.Join(errs...)
+}
 
-	created, response, err := kg.client.KnowledgeGraphWriteAPIAPI.
-		UpsertEntity(ctx, kg.namespace).
+func (kg *knowledgeGraph) writeBatch(ctx context.Context, batch *kgwrite.GraphWriteRequestDto) error {
+	written, response, err := kg.client.KnowledgeGraphWriteAPIAPI.
+		WriteGraph(ctx, kg.namespace).
 		XScopeOrgID(kg.stackID).
-		EntityWriteRequestDto(*entity).
+		GraphWriteRequestDto(*batch).
 		AllowUndeclared(true).
 		Execute()
 	if err != nil {
-		return fmt.Errorf("create entity %s/%s failed: %w", entityType, name, err)
+		return fmt.Errorf("write graph (%d entities, %d relationships) failed with status %v: %w%s",
+			len(batch.Entities), len(batch.Relationships), status(response), err, errorBody(err))
 	}
-	if response == nil || (response.StatusCode != http.StatusCreated && response.StatusCode != http.StatusOK) {
-		return fmt.Errorf("create entity %s/%s returned unexpected status %s", entityType, name, status(response))
-	}
-	kg.log.Debug("created entity",
-		"domain", created.GetDomain(), "type", created.GetType(), "name", created.GetName(), "status", status(response))
+	kg.log.Debug("written graph batch",
+		"entities", written.GetEntitiesWritten(), "relationships", written.GetRelationshipsWritten(),
+		"status", status(response))
 	return nil
 }
 
-func (kg *knowledgeGraph) upsertRelationship(ctx context.Context, fromType, fromName, toType, toName, relation string) error {
-	from := *kgwrite.NewEntityRefDto(kg.domain, fromType, fromName)
-	to := *kgwrite.NewEntityRefDto(kg.domain, toType, toName)
-	from.SetScope(kg.scope)
-	to.SetScope(kg.scope)
-
-	kg.log.Debug("creating relationship", "type", relation,
-		"fromType", from.GetType(), "fromName", from.GetName(),
-		"toType", to.GetType(), "toName", to.GetName())
-	created, response, err := kg.client.KnowledgeGraphWriteAPIAPI.
-		UpsertRelationship(ctx, kg.namespace).
-		XScopeOrgID(kg.stackID).
-		RelationshipWriteRequestDto(*kgwrite.NewRelationshipWriteRequestDto(kg.domain, relation, from, to, defaultExpirySeconds)).
-		AllowUndeclared(true).
-		Execute()
-	if err != nil {
-		return fmt.Errorf("create relationship %s failed: %w", relation, err)
+func toKGProperties(props properties) map[string]kgwrite.KgPropertyValue {
+	out := make(map[string]kgwrite.KgPropertyValue, len(props))
+	for k, v := range props {
+		// a single invalid property would make the whole batch fail
+		if _, reserved := reservedPropertyKeys[k]; reserved {
+			continue
+		}
+		switch tv := v.(type) {
+		case string:
+			out[k] = kgwrite.StringAsKgPropertyValue(&tv)
+		case int64:
+			f := float64(tv)
+			out[k] = kgwrite.Float64AsKgPropertyValue(&f)
+		case bool:
+			out[k] = kgwrite.BoolAsKgPropertyValue(&tv)
+		}
 	}
-	if response == nil || response.StatusCode != http.StatusOK {
-		return fmt.Errorf("create relationship %s returned unexpected status %s", relation, status(response))
-	}
-	kg.log.Debug("created relationship", "domain", created.GetDomain(), "type", created.GetType(), "status", status(response))
-	return nil
+	return out
 }
 
 func (kg *knowledgeGraph) deleteRelationship(ctx context.Context, fromType, fromName, toType, toName, relation string) error {
-	kg.log.Debug("deleting relationshipn", "type", relation,
+	kg.log.Debug("deleting relationship", "type", relation,
 		"fromType", fromType, "fromName", fromName,
 		"toType", toType, "toName", toName)
 	response, err := kg.client.KnowledgeGraphWriteAPIAPI.
@@ -139,12 +182,12 @@ func (kg *knowledgeGraph) deleteRelationship(ctx context.Context, fromType, from
 	if response == nil || response.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("delete relationship %s returned unexpected status %s", relation, status(response))
 	}
-	kg.log.Debug("Deleted relationship", "status", status(response))
+	kg.log.Debug("deleted relationship", "status", status(response))
 	return nil
 }
 
 func (kg *knowledgeGraph) deleteEntity(ctx context.Context, entityType, name string) error {
-	fmt.Printf("Deleting entity %s/%s\n", entityType, name)
+	kg.log.Debug("deleting entity", "type", entityType, "name", name)
 	response, err := kg.client.KnowledgeGraphWriteAPIAPI.
 		DeleteEntity(ctx, kg.namespace).
 		XScopeOrgID(kg.stackID).
@@ -159,7 +202,7 @@ func (kg *knowledgeGraph) deleteEntity(ctx context.Context, entityType, name str
 	if response == nil || response.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("delete entity %s/%s returned unexpected status %s", entityType, name, status(response))
 	}
-	fmt.Printf("Deleted entity: type=%s name=%s status=%s\n", entityType, name, status(response))
+	kg.log.Debug("deleted entity", "type", entityType, "name", name, "status", status(response))
 	return nil
 }
 
@@ -205,7 +248,7 @@ func basicAuthHeader(username string, password string) string {
 func namespaceForStack(stackID string) (string, error) {
 	stackID = strings.TrimSpace(stackID)
 	if stackID == "" {
-		return "", errors.New("missing numeric stack ID; set GRAFANA_STACK_ID or pass -stack-id")
+		return "", errors.New("missing numeric stack ID; set GRAFANA_CELL_STACK_ID")
 	}
 	for _, r := range stackID {
 		if r < '0' || r > '9' {
@@ -213,6 +256,16 @@ func namespaceForStack(stackID string) (string, error) {
 		}
 	}
 	return "stacks-" + stackID, nil
+}
+
+// errorBody returns the response body of a failed Knowledge Graph request, as the
+// generated client's error message does not contain the validation error details
+func errorBody(err error) string {
+	var apiErr *kgwrite.GenericOpenAPIError
+	if errors.As(err, &apiErr) && len(apiErr.Body()) > 0 {
+		return " (response: " + string(apiErr.Body()) + ")"
+	}
+	return ""
 }
 
 func status(response *http.Response) any {
