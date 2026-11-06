@@ -180,7 +180,14 @@ func serviceName(uid svc.UID) string {
 	return uid.Namespace + "/" + uid.Name
 }
 
-func processName(hostID string, pid app.PID) string {
+// processName uses the service instance ID of the process, which is unique per process
+// (<hostname>:<pid>) or per container (<namespace>.<pod>.<container>) in Kubernetes.
+// If two instrumented processes share the same container, they would be merged into the same
+// entity. It falls back to <hostID>/<pid> if the instance ID is not known.
+func processName(instance, hostID string, pid app.PID) string {
+	if instance != "" {
+		return instance
+	}
 	return hostID + "/" + strconv.Itoa(int(pid))
 }
 
@@ -310,7 +317,12 @@ func (g *graph) addProcess(hostID string, proc *processInfo) entityKey {
 	if proc.hostName != "" {
 		props["hostName"] = proc.hostName
 	}
-	procKey := g.addEntity(typeProcess, processName(hostID, proc.pid), props)
+	procKey := g.addEntity(typeProcess, processName(proc.service.uid.Instance, hostID, proc.pid), props)
+	// as for the services, the relation is pruned later if the Pod is not known by the informer
+	if proc.service.kubeNs != "" && proc.service.kubePod != "" {
+		g.addRelation(relRunsIn, procKey,
+			entityKey{Type: typeKubePod, Name: kubeObjectName(proc.service.kubeNs, proc.service.kubePod)})
+	}
 	if svcKey, ok := g.addService(&proc.service); ok {
 		g.addRelation(relExecutes, procKey, svcKey)
 	}

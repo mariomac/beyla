@@ -42,7 +42,7 @@ func deploymentOwners(deploy string) []*informer.Owner {
 
 func kubeService(name, ns, kubeNs, pod, deploy string) svc.Attrs {
 	return svc.Attrs{
-		UID:         svc.UID{Name: name, Namespace: ns, Instance: pod + "-" + name},
+		UID:         svc.UID{Name: name, Namespace: ns, Instance: kubeNs + "." + pod + "." + name},
 		SDKLanguage: svc.InstrumentableGolang,
 		HostName:    pod,
 		Metadata: map[attr.Name]string{
@@ -81,7 +81,7 @@ func TestBuildGraph(t *testing.T) {
 		ek(typeKubeDeployment, "default/frontend"),
 		ek(typeKubeNamespace, "default"),
 		ek(typeKubePod, "default/frontend-1234-abcd"),
-		ek(typeProcess, "host1/33"),
+		ek(typeProcess, "default.frontend-1234-abcd.frontend"),
 		ek(typeService, "shop/frontend"),
 		ek(typeServiceNamespace, "shop"),
 	}, g.sortedEntities())
@@ -91,7 +91,8 @@ func TestBuildGraph(t *testing.T) {
 		{Type: relBelongsTo, From: ek(typeKubePod, "default/frontend-1234-abcd"), To: ek(typeKubeDeployment, "default/frontend")},
 		{Type: relBelongsTo, From: ek(typeKubePod, "default/frontend-1234-abcd"), To: ek(typeKubeNamespace, "default")},
 		{Type: relBelongsTo, From: ek(typeService, "shop/frontend"), To: ek(typeServiceNamespace, "shop")},
-		{Type: relExecutes, From: ek(typeProcess, "host1/33"), To: ek(typeService, "shop/frontend")},
+		{Type: relExecutes, From: ek(typeProcess, "default.frontend-1234-abcd.frontend"), To: ek(typeService, "shop/frontend")},
+		{Type: relRunsIn, From: ek(typeProcess, "default.frontend-1234-abcd.frontend"), To: ek(typeKubePod, "default/frontend-1234-abcd")},
 		{Type: relRunsIn, From: ek(typeService, "shop/frontend"), To: ek(typeKubeDeployment, "default/frontend")},
 		{Type: relRunsIn, From: ek(typeService, "shop/frontend"), To: ek(typeKubePod, "default/frontend-1234-abcd")},
 	}, relationsOf(g))
@@ -99,7 +100,7 @@ func TestBuildGraph(t *testing.T) {
 	assert.Equal(t, properties{
 		"pid": int64(33), "ppid": int64(1), "executablePath": "/usr/bin/server", "executableName": "server",
 		"hostId": testHost, "hostName": "frontend-1234-abcd",
-	}, g.entities[ek(typeProcess, "host1/33")])
+	}, g.entities[ek(typeProcess, "default.frontend-1234-abcd.frontend")])
 	assert.Equal(t, properties{
 		"podName": "frontend-1234-abcd", "kubeNamespace": "default", "uid": "uid-frontend-1234-abcd", "nodeName": "node1",
 	}, g.entities[ek(typeKubePod, "default/frontend-1234-abcd")])
@@ -113,6 +114,31 @@ func TestBuildGraph(t *testing.T) {
 			assert.NotContains(t, reservedPropertyKeys, k, "entity %v uses reserved property key %q", e, k)
 		}
 	}
+}
+
+func TestBuildGraph_ProcessNames(t *testing.T) {
+	se := newSemanticExporter(&testCfg, &fakeWriter{}, testHost)
+	// two processes from the same executable and service, outside Kubernetes
+	se.onProcessEvent(processEvent(exec.ProcessEventCreated, 10,
+		svc.Attrs{UID: svc.UID{Name: "worker", Instance: "myhost:10"}}))
+	se.onProcessEvent(processEvent(exec.ProcessEventCreated, 11,
+		svc.Attrs{UID: svc.UID{Name: "worker", Instance: "myhost:11"}}))
+	// unknown instance ID falls back to the host ID and PID
+	se.onProcessEvent(processEvent(exec.ProcessEventCreated, 12,
+		svc.Attrs{UID: svc.UID{Name: "worker"}}))
+
+	g := se.buildGraph()
+	assert.Equal(t, []entityKey{
+		ek(typeProcess, "host1/12"),
+		ek(typeProcess, "myhost:10"),
+		ek(typeProcess, "myhost:11"),
+		ek(typeService, "worker"),
+	}, g.sortedEntities())
+	assert.Equal(t, []relationKey{
+		{Type: relExecutes, From: ek(typeProcess, "host1/12"), To: ek(typeService, "worker")},
+		{Type: relExecutes, From: ek(typeProcess, "myhost:10"), To: ek(typeService, "worker")},
+		{Type: relExecutes, From: ek(typeProcess, "myhost:11"), To: ek(typeService, "worker")},
+	}, relationsOf(g))
 }
 
 func TestBuildGraph_SpansOnly_NoKubernetes(t *testing.T) {
@@ -190,12 +216,13 @@ func TestFlush_DeletesOnlyVolatileEntities(t *testing.T) {
 	// Deployment, Namespaces and Service are not explicitly deleted: they will expire by TTL
 	assert.Equal(t, []entityKey{
 		ek(typeKubePod, "default/frontend-1234-abcd"),
-		ek(typeProcess, "host1/33"),
+		ek(typeProcess, "default.frontend-1234-abcd.frontend"),
 	}, fw.deletedEntities)
 	assert.Equal(t, []relationKey{
 		{Type: relBelongsTo, From: ek(typeKubePod, "default/frontend-1234-abcd"), To: ek(typeKubeDeployment, "default/frontend")},
 		{Type: relBelongsTo, From: ek(typeKubePod, "default/frontend-1234-abcd"), To: ek(typeKubeNamespace, "default")},
-		{Type: relExecutes, From: ek(typeProcess, "host1/33"), To: ek(typeService, "shop/frontend")},
+		{Type: relExecutes, From: ek(typeProcess, "default.frontend-1234-abcd.frontend"), To: ek(typeService, "shop/frontend")},
+		{Type: relRunsIn, From: ek(typeProcess, "default.frontend-1234-abcd.frontend"), To: ek(typeKubePod, "default/frontend-1234-abcd")},
 		{Type: relRunsIn, From: ek(typeService, "shop/frontend"), To: ek(typeKubePod, "default/frontend-1234-abcd")},
 	}, fw.deletedRelations)
 	// the remaining pod is still submitted
