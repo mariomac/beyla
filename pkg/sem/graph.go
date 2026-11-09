@@ -26,6 +26,7 @@ const (
 	typeDaemonSet        = "DaemonSet"
 	typeJob              = "Job"
 	typeCronJob          = "CronJob"
+	typeNode             = "Node"
 	typeService          = "Service"
 	typeServiceNamespace = "ServiceNamespace"
 	typeProcess          = "Process"
@@ -63,6 +64,7 @@ const kindPod = "Pod"
 // Relations between the Kubernetes workloads, pods, processes and services:
 //   - Each workload CONTROLS the Pod or workload that it directly owns
 //     (e.g. Deployment CONTROLS Pod, CronJob CONTROLS Job CONTROLS Pod).
+//   - Node HOSTS the Pods and Processes that run on it.
 //   - Pod HOSTS the Services and Processes that run on it.
 //   - The top-level workload of the Pod HOSTS the Service (e.g. Deployment HOSTS Service).
 //   - Process EXECUTES Service.
@@ -225,6 +227,12 @@ func workloadKey(env, ns, kind, name string) (entityKey, bool) {
 	return entityKey{Type: eType, Env: env, Namespace: ns, Name: name}, true
 }
 
+// nodeKey refers to a physical or virtual machine. As a node is shared by entities from different
+// environments and namespaces, it has the default environment and no namespace.
+func nodeKey(env, name string) entityKey {
+	return entityKey{Type: typeNode, Env: env, Name: name}
+}
+
 // serviceNamespaceKey refers to the OTEL service.namespace, which is not tied to any Kubernetes namespace
 func serviceNamespaceKey(env, ns string) entityKey {
 	return entityKey{Type: typeServiceNamespace, Env: env, Name: ns}
@@ -383,7 +391,16 @@ type processInfo struct {
 	hostName string
 }
 
-func (g *graph) addPod(pod *podInfo) {
+// hostInfo describes the host where Beyla runs, which is the node of the processes that are not in Kubernetes
+type hostInfo struct {
+	id string
+	// name is used as node name when the process does not provide its own host name
+	name string
+	// defaultEnv is the environment of the nodes
+	defaultEnv string
+}
+
+func (g *graph) addPod(pod *podInfo, nodeEnv string) {
 	podProps := properties{}
 	if pod.uid != "" {
 		podProps["uid"] = pod.uid
@@ -396,6 +413,10 @@ func (g *graph) addPod(pod *podInfo) {
 		podProps["workload_type"] = pod.topOwnerKind
 	}
 	child := g.addEntity(pod.key(), podProps)
+	if pod.nodeName != "" {
+		nk := g.addEntity(nodeKey(nodeEnv, pod.nodeName), nil)
+		g.addRelation(relHosts, nk, child)
+	}
 	for _, wk := range pod.workloads {
 		g.addEntity(wk, nil)
 		g.addRelation(relControls, wk, child)
@@ -433,7 +454,7 @@ func (g *graph) addService(si *serviceInfo, pods map[podRef]*podInfo) (entityKey
 	return svcKey, true
 }
 
-func (g *graph) addProcess(hostID string, proc *processInfo, pods map[podRef]*podInfo) entityKey {
+func (g *graph) addProcess(host *hostInfo, proc *processInfo, pods map[podRef]*podInfo) entityKey {
 	props := properties{"pid": int64(proc.pid)}
 	if proc.ppid != 0 {
 		props["ppid"] = int64(proc.ppid)
@@ -444,8 +465,8 @@ func (g *graph) addProcess(hostID string, proc *processInfo, pods map[podRef]*po
 	if proc.exeName != "" {
 		props["process_executable_name"] = proc.exeName
 	}
-	if hostID != "" {
-		props["host_id"] = hostID
+	if host.id != "" {
+		props["host_id"] = host.id
 	}
 	if proc.hostName != "" {
 		props["host_name"] = proc.hostName
@@ -454,13 +475,43 @@ func (g *graph) addProcess(hostID string, proc *processInfo, pods map[podRef]*po
 		Type:      typeProcess,
 		Env:       proc.service.env,
 		Namespace: proc.service.kubeNs,
-		Name:      processName(proc.service.uid.Instance, hostID, proc.pid),
+		Name:      processName(proc.service.uid.Instance, host.id, proc.pid),
 	}, props)
-	if pod, ok := proc.service.pod(pods); ok {
+	pod, inPod := proc.service.pod(pods)
+	if inPod {
 		g.addRelation(relHosts, pod.key(), procKey)
 	}
+	g.addProcessNode(host, proc, pod, procKey)
 	if svcKey, ok := g.addService(&proc.service, pods); ok {
 		g.addRelation(relExecutes, procKey, svcKey)
 	}
 	return procKey
+}
+
+// addProcessNode relates the process with the node where it runs: the node of its Pod or,
+// out of Kubernetes, the host where Beyla runs. The pod argument is nil if the Pod is not known.
+func (g *graph) addProcessNode(host *hostInfo, proc *processInfo, pod *podInfo, procKey entityKey) {
+	if pod != nil {
+		if pod.nodeName != "" {
+			g.addRelation(relHosts, nodeKey(host.defaultEnv, pod.nodeName), procKey)
+		}
+		return
+	}
+	if proc.service.kubeNs != "" {
+		// the process runs in a Pod that is not known yet, so we don't know its node
+		return
+	}
+	nodeName := proc.hostName
+	if nodeName == "" {
+		nodeName = host.name
+	}
+	if nodeName == "" {
+		return
+	}
+	props := properties{}
+	if host.id != "" {
+		props["host_id"] = host.id
+	}
+	nk := g.addEntity(nodeKey(host.defaultEnv, nodeName), props)
+	g.addRelation(relHosts, nk, procKey)
 }

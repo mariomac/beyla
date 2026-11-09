@@ -74,6 +74,33 @@ func processEvent(eventType exec.ProcessEventType, pid int, attrs svc.Attrs) *ex
 
 func relationsOf(g *graph) []relationKey { return g.sortedRelations() }
 
+// withoutNodes returns a copy of the graph without the Node entities and their relations,
+// for the tests that do not focus on them
+func withoutNodes(g *graph) *graph {
+	out := newGraph()
+	for e, props := range g.entities {
+		if e.Type != typeNode {
+			out.entities[e] = props
+		}
+	}
+	for r := range g.relations {
+		if r.From.Type != typeNode && r.To.Type != typeNode {
+			out.relations[r] = struct{}{}
+		}
+	}
+	return out
+}
+
+// testHostName is the host name of Beyla in the tests
+const testHostName = "localnode"
+
+// newTestExporter returns a semantic exporter that does not depend on the host name of the machine running the tests
+func newTestExporter(cfg *SemanticConfig, kg graphWriter, hostID string) *semanticExporter {
+	se := newSemanticExporter(cfg, kg, hostID)
+	se.host.name = testHostName
+	return se
+}
+
 // ek returns the key of an entity that is not in a Kubernetes namespace
 func ek(t, n string) entityKey { return entityKey{Type: t, Env: defaultEnvironment, Name: n} }
 
@@ -83,7 +110,7 @@ func ekn(t, ns, n string) entityKey {
 }
 
 func TestBuildGraph(t *testing.T) {
-	se := newSemanticExporter(&testCfg, &fakeWriter{}, testHost)
+	se := newTestExporter(&testCfg, &fakeWriter{}, testHost)
 	attrs := kubeService("frontend", "shop", "default", "frontend-1234-abcd", "frontend")
 
 	require.NoError(t, se.On(podEvent(informer.EventType_CREATED, "default", "frontend-1234-abcd", deploymentOwners("frontend")...)))
@@ -99,13 +126,16 @@ func TestBuildGraph(t *testing.T) {
 	service := ekn(typeService, "default", "frontend")
 	// the OTEL service namespace is not tied to any Kubernetes namespace
 	serviceNs := ek(typeServiceNamespace, "shop")
-	assert.Equal(t, []entityKey{deploy, pod, proc, service, serviceNs}, g.sortedEntities())
+	node := ek(typeNode, "node1")
+	assert.Equal(t, []entityKey{deploy, node, pod, proc, service, serviceNs}, g.sortedEntities())
 
 	assert.Equal(t, []relationKey{
 		{Type: relControls, From: deploy, To: pod},
 		{Type: relExecutes, From: proc, To: service},
 		{Type: relHasMember, From: serviceNs, To: service},
 		{Type: relHosts, From: deploy, To: service},
+		{Type: relHosts, From: node, To: pod},
+		{Type: relHosts, From: node, To: proc},
 		{Type: relHosts, From: pod, To: proc},
 		{Type: relHosts, From: pod, To: service},
 	}, relationsOf(g))
@@ -130,7 +160,7 @@ func TestBuildGraph(t *testing.T) {
 }
 
 func TestBuildGraph_WorkloadExecutesService(t *testing.T) {
-	se := newSemanticExporter(&testCfg, &fakeWriter{}, testHost)
+	se := newTestExporter(&testCfg, &fakeWriter{}, testHost)
 	// a standalone pod, without owners
 	require.NoError(t, se.On(podEvent(informer.EventType_CREATED, "default", "standalone",
 		&informer.Owner{Kind: "Pod", Name: "standalone"})))
@@ -154,7 +184,7 @@ func TestBuildGraph_WorkloadExecutesService(t *testing.T) {
 		{Service: kubeServiceOwner("custom", "", "default", "custom-1", "Rollout", "custom")},
 	})
 
-	g := se.buildGraph()
+	g := withoutNodes(se.buildGraph())
 	k := func(t, n string) entityKey { return ekn(t, "default", n) }
 	assert.Equal(t, []entityKey{
 		k(typeCronJob, "backup"),
@@ -199,7 +229,7 @@ func TestBuildGraph_WorkloadExecutesService(t *testing.T) {
 
 func TestBuildGraph_Environment(t *testing.T) {
 	cfg := (&SemanticConfig{Environment: "staging"}).withDefaults()
-	se := newSemanticExporter(&cfg, &fakeWriter{}, testHost)
+	se := newTestExporter(&cfg, &fakeWriter{}, testHost)
 
 	// the environment of a pod is taken from the resource attributes in the annotations and
 	// the containers OTEL_RESOURCE_ATTRIBUTES, which takes precedence
@@ -222,7 +252,7 @@ func TestBuildGraph_Environment(t *testing.T) {
 	plain := kubeService("plain", "", "default", "plain-abc", "")
 	se.onSpans([]request.Span{{Service: attrs}, {Service: plain}})
 
-	g := se.buildGraph()
+	g := withoutNodes(se.buildGraph())
 	key := func(t, env, n string) entityKey { return entityKey{Type: t, Env: env, Namespace: "default", Name: n} }
 	assert.Equal(t, []entityKey{
 		key(typeDeployment, "qa", "annotated"),
@@ -241,7 +271,7 @@ func TestBuildGraph_Environment(t *testing.T) {
 }
 
 func TestBuildGraph_ServiceNames(t *testing.T) {
-	se := newSemanticExporter(&testCfg, &fakeWriter{}, testHost)
+	se := newTestExporter(&testCfg, &fakeWriter{}, testHost)
 	require.NoError(t, se.On(podEvent(informer.EventType_CREATED, "tapas", "tapas-backend-abc", deploymentOwners("tapas-backend")...)))
 	se.onSpans([]request.Span{
 		// in Kubernetes, the OTEL service namespace defaults to the Kubernetes namespace. The name
@@ -253,7 +283,7 @@ func TestBuildGraph_ServiceNames(t *testing.T) {
 		{Service: svc.Attrs{UID: svc.UID{Name: "api"}}},
 	})
 
-	g := se.buildGraph()
+	g := withoutNodes(se.buildGraph())
 	var services []entityKey
 	for _, e := range g.sortedEntities() {
 		if e.Type == typeService {
@@ -268,8 +298,48 @@ func TestBuildGraph_ServiceNames(t *testing.T) {
 	}, services)
 }
 
+func TestBuildGraph_Nodes(t *testing.T) {
+	cfg := (&SemanticConfig{Environment: "staging"}).withDefaults()
+	se := newTestExporter(&cfg, &fakeWriter{}, testHost)
+
+	// a pod in node2, whose environment differs from the default one
+	pod := podEvent(informer.EventType_CREATED, "default", "api-abc", deploymentOwners("api")...)
+	pod.Resource.Pod.NodeName = "node2"
+	pod.Resource.Annotations = map[string]string{"resource.opentelemetry.io/deployment.environment.name": "prod"}
+	require.NoError(t, se.On(pod))
+	se.onProcessEvent(processEvent(exec.ProcessEventCreated, 10, kubeService("api", "", "default", "api-abc", "api")))
+	// a Kubernetes process whose pod is not known yet: we don't know its node
+	se.onProcessEvent(processEvent(exec.ProcessEventCreated, 11, kubeService("unknown", "", "default", "unknown-abc", "unknown")))
+	// processes out of Kubernetes run in the same host as Beyla
+	se.onProcessEvent(processEvent(exec.ProcessEventCreated, 12,
+		svc.Attrs{UID: svc.UID{Name: "local", Instance: "myhost:12"}, HostName: "myhost"}))
+	se.onProcessEvent(processEvent(exec.ProcessEventCreated, 13,
+		svc.Attrs{UID: svc.UID{Name: "nohost", Instance: "x:13"}}))
+
+	g := se.buildGraph()
+	// nodes are shared by entities from different environments and namespaces,
+	// so they take the default environment and no namespace
+	node2 := entityKey{Type: typeNode, Env: "staging", Name: "node2"}
+	myhost := entityKey{Type: typeNode, Env: "staging", Name: "myhost"}
+	localnode := entityKey{Type: typeNode, Env: "staging", Name: testHostName}
+	var nodeRelations []relationKey
+	for _, r := range g.sortedRelations() {
+		if r.From.Type == typeNode {
+			nodeRelations = append(nodeRelations, r)
+		}
+	}
+	assert.Equal(t, []relationKey{
+		{Type: relHosts, From: localnode, To: entityKey{Type: typeProcess, Env: "staging", Name: "x:13"}},
+		{Type: relHosts, From: myhost, To: entityKey{Type: typeProcess, Env: "staging", Name: "myhost:12"}},
+		{Type: relHosts, From: node2, To: entityKey{Type: typePod, Env: "prod", Namespace: "default", Name: "api-abc"}},
+		{Type: relHosts, From: node2, To: entityKey{Type: typeProcess, Env: "staging", Namespace: "default", Name: "default.api-abc.api"}},
+	}, nodeRelations)
+	assert.Equal(t, properties{"host_id": testHost}, g.entities[myhost])
+	assert.Empty(t, g.entities[node2])
+}
+
 func TestBuildGraph_ProcessNames(t *testing.T) {
-	se := newSemanticExporter(&testCfg, &fakeWriter{}, testHost)
+	se := newTestExporter(&testCfg, &fakeWriter{}, testHost)
 	// two processes from the same executable and service, outside Kubernetes
 	se.onProcessEvent(processEvent(exec.ProcessEventCreated, 10,
 		svc.Attrs{UID: svc.UID{Name: "worker", Instance: "myhost:10"}}))
@@ -279,7 +349,7 @@ func TestBuildGraph_ProcessNames(t *testing.T) {
 	se.onProcessEvent(processEvent(exec.ProcessEventCreated, 12,
 		svc.Attrs{UID: svc.UID{Name: "worker"}}))
 
-	g := se.buildGraph()
+	g := withoutNodes(se.buildGraph())
 	assert.Equal(t, []entityKey{
 		ek(typeProcess, "host1/12"),
 		ek(typeProcess, "myhost:10"),
@@ -294,20 +364,20 @@ func TestBuildGraph_ProcessNames(t *testing.T) {
 }
 
 func TestBuildGraph_SpansOnly_NoKubernetes(t *testing.T) {
-	se := newSemanticExporter(&testCfg, &fakeWriter{}, testHost)
+	se := newTestExporter(&testCfg, &fakeWriter{}, testHost)
 	// the service decorates with Kubernetes metadata, but the pod is not known by the informer
 	// (e.g. it is still being synchronized), so no dangling relations must be submitted
 	attrs := kubeService("backend", "", "default", "backend-abcd", "backend")
 	attrs.ProcPID = 44
 	se.onSpans([]request.Span{{Service: attrs}, {Service: attrs}})
 
-	g := se.buildGraph()
+	g := withoutNodes(se.buildGraph())
 	assert.Equal(t, []entityKey{ekn(typeService, "default", "backend")}, g.sortedEntities())
 	assert.Empty(t, relationsOf(g))
 }
 
 func TestBuildGraph_PodWithoutDeployment(t *testing.T) {
-	se := newSemanticExporter(&testCfg, &fakeWriter{}, testHost)
+	se := newTestExporter(&testCfg, &fakeWriter{}, testHost)
 	require.NoError(t, se.On(podEvent(informer.EventType_CREATED, "kube-system", "standalone",
 		&informer.Owner{Kind: "Pod", Name: "standalone"})))
 	// non-pod events and finished pods are ignored
@@ -317,14 +387,14 @@ func TestBuildGraph_PodWithoutDeployment(t *testing.T) {
 	finished.Resource.Pod.Finished = true
 	require.NoError(t, se.On(finished))
 
-	g := se.buildGraph()
+	g := withoutNodes(se.buildGraph())
 	assert.Equal(t, []entityKey{ekn(typePod, "kube-system", "standalone")}, g.sortedEntities())
 	assert.Empty(t, relationsOf(g))
 }
 
 func TestServicesExpireAfterTTL(t *testing.T) {
 	now := time.Unix(1000, 0)
-	se := newSemanticExporter(&testCfg, &fakeWriter{}, testHost)
+	se := newTestExporter(&testCfg, &fakeWriter{}, testHost)
 	se.clock = func() time.Time { return now }
 
 	se.onSpans([]request.Span{{Service: svc.Attrs{UID: svc.UID{Name: "svc1"}}}})
@@ -343,7 +413,7 @@ func TestServicesExpireAfterTTL(t *testing.T) {
 
 func TestFlush_DeletesOnlyVolatileEntities(t *testing.T) {
 	fw := &fakeWriter{}
-	se := newSemanticExporter(&testCfg, fw, testHost)
+	se := newTestExporter(&testCfg, fw, testHost)
 	attrs := kubeService("frontend", "shop", "default", "frontend-1234-abcd", "frontend")
 	require.NoError(t, se.On(podEvent(informer.EventType_CREATED, "default", "frontend-1234-abcd", deploymentOwners("frontend")...)))
 	require.NoError(t, se.On(podEvent(informer.EventType_CREATED, "default", "frontend-1234-efgh", deploymentOwners("frontend")...)))
@@ -363,11 +433,13 @@ func TestFlush_DeletesOnlyVolatileEntities(t *testing.T) {
 	pod := ekn(typePod, "default", "frontend-1234-abcd")
 	proc := ekn(typeProcess, "default", "default.frontend-1234-abcd.frontend")
 	service := ekn(typeService, "default", "frontend")
-	// Deployment, Service and ServiceNamespace are not explicitly deleted: they will expire by TTL
+	// Deployment, Node, Service and ServiceNamespace are not explicitly deleted: they will expire by TTL
 	assert.Equal(t, []entityKey{pod, proc}, fw.deletedEntities)
 	assert.Equal(t, []relationKey{
 		{Type: relControls, From: ekn(typeDeployment, "default", "frontend"), To: pod},
 		{Type: relExecutes, From: proc, To: service},
+		{Type: relHosts, From: ek(typeNode, "node1"), To: pod},
+		{Type: relHosts, From: ek(typeNode, "node1"), To: proc},
 		{Type: relHosts, From: pod, To: proc},
 		{Type: relHosts, From: pod, To: service},
 	}, fw.deletedRelations)
@@ -382,7 +454,7 @@ func TestRun_ConsumesQueues(t *testing.T) {
 	spans := msg.NewQueue[[]request.Span](msg.ChannelBufferLen(10))
 	procs := msg.NewQueue[exec.ProcessEvent](msg.ChannelBufferLen(10))
 
-	se := newSemanticExporter(&cfg, fw, testHost)
+	se := newTestExporter(&cfg, fw, testHost)
 	se.spans = spans.Subscribe()
 	se.processEvents = procs.Subscribe()
 
@@ -402,7 +474,7 @@ func TestRun_ConsumesQueues(t *testing.T) {
 		assert.Equal(ct, []relationKey{
 			{Type: relExecutes, From: ek(typeProcess, "host1/12"), To: ek(typeService, "other")},
 			{Type: relExecutes, From: ek(typeProcess, "host1/12"), To: ek(typeService, "svc")},
-		}, g.sortedRelations())
+		}, withoutNodes(g).sortedRelations())
 	}, 5*time.Second, 10*time.Millisecond)
 
 	cancel()
@@ -461,7 +533,7 @@ func TestKnowledgeGraph_WriteGraphBatches(t *testing.T) {
 		g.addPod(&podInfo{
 			env: "prod", namespace: "ns", name: fmt.Sprintf("pod%d", i), uid: fmt.Sprintf("uid%d", i),
 			workloads: []entityKey{{Type: typeDeployment, Env: "prod", Namespace: "ns", Name: fmt.Sprintf("deploy%d", i)}},
-		})
+		}, "prod")
 	}
 	// an entity out of any Kubernetes namespace
 	g.addEntity(serviceNamespaceKey("prod", "otelns"), nil)

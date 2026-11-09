@@ -140,6 +140,11 @@ func SemanticExporter(
 	}
 }
 
+func hostName() string {
+	hn, _ := os.Hostname()
+	return hn
+}
+
 func hostID(ctxInfo *global.ContextInfo) string {
 	if ctxInfo.NodeMeta.HostID != "" {
 		return ctxInfo.NodeMeta.HostID
@@ -162,11 +167,11 @@ type seenService struct {
 }
 
 type semanticExporter struct {
-	cfg    *SemanticConfig
-	log    *slog.Logger
-	kg     graphWriter
-	hostID string
-	clock  func() time.Time
+	cfg   *SemanticConfig
+	log   *slog.Logger
+	kg    graphWriter
+	host  hostInfo
+	clock func() time.Time
 
 	kubeStore     *kube.Store
 	spans         <-chan []request.Span
@@ -190,7 +195,7 @@ func newSemanticExporter(cfg *SemanticConfig, kg graphWriter, hostID string) *se
 		cfg:       cfg,
 		log:       elog(),
 		kg:        kg,
-		hostID:    hostID,
+		host:      hostInfo{id: hostID, name: hostName(), defaultEnv: cfg.Environment},
 		clock:     time.Now,
 		pods:      map[podRef]*podInfo{},
 		processes: map[app.PID]*processInfo{},
@@ -327,11 +332,11 @@ func (se *semanticExporter) buildGraph() *graph {
 
 	g := newGraph()
 	for _, pod := range se.pods {
-		g.addPod(pod)
+		g.addPod(pod, se.cfg.Environment)
 	}
 	procKeys := make(map[app.PID]entityKey, len(se.processes))
 	for pid, proc := range se.processes {
-		procKeys[pid] = g.addProcess(se.hostID, proc, se.pods)
+		procKeys[pid] = g.addProcess(&se.host, proc, se.pods)
 	}
 	for uid, seen := range se.services {
 		if now.Sub(seen.lastSeen) > se.cfg.TTL {
