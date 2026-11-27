@@ -75,7 +75,7 @@ func main() {
 	flag.Var(&flagPaths, "config", "path to a configuration file. Repeat the flag to layer several files, in increasing order of priority")
 	flag.Parse()
 
-	paths := configFilePaths(flagPaths, os.Getenv("BEYLA_CONFIG_PATH"))
+	paths := configFilePaths(flagPaths, configPathsFromEnv(os.Getenv))
 	config, configVersion, configSources := loadConfig(paths)
 	if err := config.Validate(); err != nil {
 		slog.Error("wrong Beyla configuration", "error", err)
@@ -195,8 +195,17 @@ func (p *configPaths) Set(path string) error {
 	return nil
 }
 
+// configPathsFromEnv returns the list of files in BEYLA_CONFIG_PATH or, when it is empty,
+// in OTEL_EBPF_CONFIG_PATH, as for the rest of the settings that Beyla also reads with the OBI prefix.
+func configPathsFromEnv(getenv func(string) string) string {
+	if paths := getenv("BEYLA_CONFIG_PATH"); paths != "" {
+		return paths
+	}
+	return getenv("OTEL_EBPF_CONFIG_PATH")
+}
+
 // configFilePaths returns the configuration files in increasing order of priority:
-// the -config flags in order, then the files in BEYLA_CONFIG_PATH, separated by the
+// the -config flags in order, then the files in BEYLA_CONFIG_PATH (or OTEL_EBPF_CONFIG_PATH), separated by the
 // OS path list separator (colon on Linux), from left to right.
 func configFilePaths(flags []string, envPaths string) []string {
 	paths := slices.Clone(flags)
@@ -237,7 +246,7 @@ func loadConfigSources(sources []configbridge.Source) (*beyla.Config, string, er
 	}
 
 	if merged.Version == configbridge.VersionV2 {
-		obiCfg, err := configbridge.LoadV2(merged.Data)
+		obiCfg, err := configbridge.LoadMerged(merged)
 		if err != nil {
 			return nil, "", err
 		}
@@ -255,7 +264,11 @@ func loadConfigSources(sources []configbridge.Source) (*beyla.Config, string, er
 	if len(sources) > 0 {
 		reader = bytes.NewReader(merged.Data)
 	}
-	cfg, err := beyla.LoadConfigWithOverrides(reader, applyV2Shared(merged.Shared))
+	load := beyla.LoadConfigWithOverrides
+	if merged.Expanded {
+		load = beyla.LoadConfigExpanded
+	}
+	cfg, err := load(reader, applyV2Shared(merged.Shared))
 	if err != nil {
 		return nil, "", err
 	}
@@ -310,9 +323,9 @@ func startConfigRefresh(ctx context.Context, config *beyla.Config, sources []con
 	// The v1 file watcher reads a single file. With layered files, only the control socket
 	// can refresh the criteria.
 	var configPath string
-	var configData []byte
+	var startup configrefresh.Startup
 	if len(sources) == 1 {
-		configPath, configData = sources[0].Path, sources[0].Data
+		configPath, startup.Data = sources[0].Path, sources[0].Data
 	} else if len(sources) > 1 {
 		slog.Debug("discovery criteria refresh from files is not available with multiple v1 configuration files")
 		merged, err := configbridge.MergeSources(sources)
@@ -320,14 +333,16 @@ func startConfigRefresh(ctx context.Context, config *beyla.Config, sources []con
 			slog.Error("can't merge the configuration files", "error", err)
 			return nil
 		}
-		configData = merged.Data
+		// The reference for the refreshes must be the effective startup configuration,
+		// including the settings that v2 files override.
+		startup = configrefresh.Startup{Data: merged.Data, Expanded: merged.Expanded, Apply: applyV2Shared(merged.Shared)}
 	}
 
 	if conn == nil && configPath == "" {
 		return nil
 	}
 
-	refresher, err := configrefresh.New(config, configData)
+	refresher, err := configrefresh.NewFromStartup(config, startup)
 	if err != nil {
 		slog.Debug("configuration refresh disabled", "reason", err)
 		if conn != nil {
@@ -339,7 +354,7 @@ func startConfigRefresh(ctx context.Context, config *beyla.Config, sources []con
 	if conn != nil {
 		go configrefresh.Serve(ctx, conn, refresher.Refresh)
 	} else {
-		go configrefresh.Watch(ctx, configPath, configData, refresher)
+		go configrefresh.Watch(ctx, configPath, startup.Data, refresher)
 	}
 
 	if updater := refresher.Updater(); updater != nil {

@@ -17,7 +17,14 @@ import (
 // runtime, which the startup load didn't see.
 // A nil environment reads them from the process.
 func LoadRefreshConfig(data []byte, environment map[string]string) (*Config, error) {
-	cfg, err := loadConfigFile(bytes.NewReader(data), environment, nil)
+	return LoadRefreshConfigWith(data, environment, false, nil)
+}
+
+// LoadRefreshConfigWith is like LoadRefreshConfig, for data that comes from layering several
+// files: expanded tells that its environment references are already expanded, and apply sets the
+// overrides that come from files of another version, before the environment is read.
+func LoadRefreshConfigWith(data []byte, environment map[string]string, expanded bool, apply func(*Config)) (*Config, error) {
+	cfg, err := loadConfigData(bytes.NewReader(data), loadOptions{environment: environment, apply: apply, expanded: expanded})
 	if err != nil {
 		return nil, err
 	}

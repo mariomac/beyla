@@ -239,3 +239,37 @@ func TestNew_SurveyOnly(t *testing.T) {
 	require.ErrorContains(t, err, "not enabled at startup")
 	assert.ErrorContains(t, err, "restart Beyla")
 }
+
+// A v2 file can override a setting of the v1 base. The reference that refreshes are compared
+// with must include it, or a complete request that preserves it would be rejected as a change.
+func TestRefresher_StartupReferenceIncludesLayeredOverrides(t *testing.T) {
+	data := testConfig(portSelection(8080))
+	override := func(cfg *beyla.Config) { cfg.ChannelBufferLen = 77 }
+
+	cfg, err := beyla.LoadConfigWithOverrides(bytes.NewReader(data), override)
+	require.NoError(t, err)
+	require.NoError(t, cfg.Validate())
+	refresher, err := NewFromStartup(cfg, Startup{Data: data, Apply: override})
+	require.NoError(t, err)
+
+	updates := refresher.Updater().Updates()
+	go func() {
+		for {
+			select {
+			case <-t.Context().Done():
+				return
+			case update := <-updates.Requests():
+				updates.Complete(update, nil)
+			}
+		}
+	}()
+
+	request := append(testConfig(portSelection(9090)), "channel_buffer_len: 77\n"...)
+	require.NoError(t, refresher.Refresh(t.Context(), request))
+
+	// Changing the overridden setting is still a restart-only change.
+	request = append(testConfig(portSelection(9090)), "channel_buffer_len: 50\n"...)
+	err = refresher.Refresh(t.Context(), request)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "channel_buffer_len")
+}

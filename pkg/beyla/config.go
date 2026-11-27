@@ -696,7 +696,26 @@ func LoadConfigWithOverrides(file io.Reader, apply func(*Config)) (*Config, erro
 	return loadConfigFile(file, nil, apply)
 }
 
+// LoadConfigExpanded is like LoadConfigWithOverrides, for a file whose environment references
+// have already been expanded, as the result of layering several files.
+func LoadConfigExpanded(file io.Reader, apply func(*Config)) (*Config, error) {
+	OverrideOBIGlobalConfig()
+	return loadConfigData(file, loadOptions{apply: apply, expanded: true})
+}
+
+type loadOptions struct {
+	environment map[string]string
+	apply       func(*Config)
+	// expanded is true if the environment references in the file are already expanded.
+	expanded bool
+}
+
 func loadConfigFile(file io.Reader, environment map[string]string, apply func(*Config)) (*Config, error) {
+	return loadConfigData(file, loadOptions{environment: environment, apply: apply})
+}
+
+func loadConfigData(file io.Reader, opts loadOptions) (*Config, error) {
+	environment, apply := opts.environment, opts.apply
 	cfg := *DefaultConfig()
 	if file != nil {
 		cfgBuf, err := io.ReadAll(file)
@@ -708,7 +727,9 @@ func loadConfigFile(file io.Reader, environment map[string]string, apply func(*C
 		if environment != nil {
 			getenv = func(name string) string { return environment[name] }
 		}
-		cfgBuf = config.ReplaceEnvFrom(cfgBuf, getenv)
+		if !opts.expanded {
+			cfgBuf = config.ReplaceEnvFrom(cfgBuf, getenv)
+		}
 		if err := yaml.Unmarshal(cfgBuf, &cfg); err != nil {
 			return nil, fmt.Errorf("parsing YAML configuration: %w", err)
 		}

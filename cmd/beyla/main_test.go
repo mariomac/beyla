@@ -22,6 +22,19 @@ func TestConfigFilePaths(t *testing.T) {
 		configFilePaths([]string{"base.yml", "site.yml"}, "team.yml"+sep+sep+"local.yml"))
 }
 
+func TestConfigPathsFromEnv(t *testing.T) {
+	env := func(vars map[string]string) func(string) string {
+		return func(name string) string { return vars[name] }
+	}
+	assert.Empty(t, configPathsFromEnv(env(nil)))
+	assert.Equal(t, "a.yml", configPathsFromEnv(env(map[string]string{"OTEL_EBPF_CONFIG_PATH": "a.yml"})))
+	assert.Equal(t, "b.yml", configPathsFromEnv(env(map[string]string{"BEYLA_CONFIG_PATH": "b.yml"})))
+	// the Beyla prefix wins
+	assert.Equal(t, "b.yml", configPathsFromEnv(env(map[string]string{
+		"BEYLA_CONFIG_PATH": "b.yml", "OTEL_EBPF_CONFIG_PATH": "a.yml",
+	})))
+}
+
 func TestConfigPathsFlag(t *testing.T) {
 	var paths configPaths
 	require.NoError(t, paths.Set("a.yml"))

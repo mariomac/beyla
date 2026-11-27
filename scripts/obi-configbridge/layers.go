@@ -54,6 +54,10 @@ type Merged struct {
 	Version string
 	// Data is the merged document, in the format of Version.
 	Data []byte
+	// Expanded is true when the environment references in Data have already been expanded,
+	// which happens when several files are layered. Loaders must not expand them again, or
+	// an escaped $${TOKEN} would be substituted and values with placeholders re-expanded.
+	Expanded bool
 	// Shared is only set for a v1 base that has v2 overrides.
 	Shared *V1Shared
 }
@@ -109,7 +113,7 @@ func MergeSources(sources []Source) (*Merged, error) {
 		paths = append(paths, source.Path)
 	}
 
-	merged := &Merged{Version: base}
+	merged := &Merged{Version: base, Expanded: true}
 	switch {
 	case base == VersionV2 && len(pending.fields) != 0:
 		if err := pending.mergeLegacyFields(document); err != nil {
@@ -141,11 +145,28 @@ func LoadSources(sources []Source) (*obi.Config, *Merged, error) {
 	if merged.Version != VersionV2 {
 		return nil, merged, nil
 	}
-	cfg, err := LoadV2(merged.Data)
+	cfg, err := LoadMerged(merged)
 	if err != nil {
 		return nil, nil, err
 	}
 	return cfg, merged, nil
+}
+
+// LoadMerged converts a merged v2 document into a runtime config, expanding the
+// environment references only if MergeSources hasn't done it yet.
+func LoadMerged(m *Merged) (*obi.Config, error) {
+	if !m.Expanded {
+		return LoadV2(m.Data)
+	}
+	doc, _, err := schema.ParseStandaloneYAML(m.Data)
+	if err != nil {
+		return nil, fmt.Errorf("loading config v2: %w", err)
+	}
+	cfg, err := loadDocument(doc)
+	if err != nil {
+		return nil, fmt.Errorf("loading config v2: %w", err)
+	}
+	return cfg, nil
 }
 
 func detectVersion(data []byte) (string, error) {

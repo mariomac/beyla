@@ -24,10 +24,25 @@ type Refresher struct {
 	setSampler  func(services.SamplerConfig)
 }
 
+// Startup describes how the running configuration was loaded, to reproduce it as the reference
+// that refreshes are compared with.
+type Startup struct {
+	Data []byte
+	// Expanded tells that the environment references in Data are already expanded.
+	Expanded bool
+	// Apply sets the overrides that came from files of another version.
+	Apply func(*beyla.Config)
+}
+
 // New returns a Refresher for a Beyla running cfg, which was loaded from data, or an error
 // explaining why its application pipeline cannot refresh.
 // It must be called before the pipeline starts, which modifies the process environment.
 func New(cfg *beyla.Config, data []byte) (*Refresher, error) {
+	return NewFromStartup(cfg, Startup{Data: data})
+}
+
+// NewFromStartup is like New, for a configuration that was loaded from layered files.
+func NewFromStartup(cfg *beyla.Config, startup Startup) (*Refresher, error) {
 	if !cfg.InstrumentationEnabled() {
 		return nil, errors.New("restart Beyla to apply configuration changes because application instrumentation was not enabled at startup")
 	}
@@ -36,19 +51,19 @@ func New(cfg *beyla.Config, data []byte) (*Refresher, error) {
 
 	// Loading again keeps the reference configuration apart from the running one, which
 	// the pipeline is free to modify.
-	startup, err := r.Load(data)
+	reference, err := beyla.LoadRefreshConfigWith(startup.Data, r.environment, startup.Expanded, startup.Apply)
 	if err != nil {
 		return nil, fmt.Errorf("reloading the startup configuration: %w", err)
 	}
 
-	r.startup = startup
+	r.startup = reference
 	if cfg.Discovery.InstrumentAllLocal {
 		selector := obiDiscover.NewDynamicSelector()
 		selector.SetTraceSampler(cfg.Traces.SamplerConfig)
 		cfg.SetLocalPIDSelector(selector)
 		r.setSampler = selector.SetTraceSampler
 	} else {
-		r.updater = obiDiscover.NewCriteriaUpdater(startup.AsOBI())
+		r.updater = obiDiscover.NewCriteriaUpdater(reference.AsOBI())
 	}
 	return r, nil
 }

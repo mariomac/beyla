@@ -48,7 +48,7 @@ func TestMergeSources_V1OverV1(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, configbridge.VersionV1, merged.Version)
 
-	cfg, err := LoadConfig(bytes.NewReader(merged.Data))
+	cfg, err := LoadConfigExpanded(bytes.NewReader(merged.Data), nil)
 	require.NoError(t, err)
 	assert.Equal(t, "info", cfg.LogLevel)
 	// mappings merge by key
@@ -78,7 +78,7 @@ func TestMergeSources_V2OverV2(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, configbridge.VersionV2, merged.Version)
 
-	cfg, err := configbridge.LoadV2(merged.Data)
+	cfg, err := configbridge.LoadMerged(merged)
 	require.NoError(t, err)
 	assert.Equal(t, 20, cfg.ChannelBufferLen)
 	assert.Equal(t, 3*time.Second, cfg.ChannelSendTimeout)
@@ -92,7 +92,7 @@ func TestMergeSources_V2BaseWithV1Override(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, configbridge.VersionV2, merged.Version)
 
-	cfg, err := configbridge.LoadV2(merged.Data)
+	cfg, err := configbridge.LoadMerged(merged)
 	require.NoError(t, err)
 	assert.Equal(t, 77, cfg.ChannelBufferLen)
 	assert.Equal(t, 9*time.Second, cfg.ShutdownTimeout)
@@ -123,7 +123,7 @@ func TestMergeSources_BaseVersionWinsWhenLater(t *testing.T) {
 		src("last.yml", v2Capture("    capture:\n      channels:\n        buffer_len: 20\n")),
 	})
 	require.NoError(t, err)
-	cfg, err := configbridge.LoadV2(merged.Data)
+	cfg, err := configbridge.LoadMerged(merged)
 	require.NoError(t, err)
 	assert.Equal(t, 20, cfg.ChannelBufferLen)
 }
@@ -164,4 +164,21 @@ func TestLoadConfigWithOverrides_AppliedBeforeEnv(t *testing.T) {
 	// the file override beats the file, but not the environment
 	assert.Equal(t, 333, cfg.ChannelBufferLen)
 	assert.Equal(t, "debug", cfg.LogLevel)
+}
+
+func TestMergeSources_EnvIsExpandedOnlyOnce(t *testing.T) {
+	t.Setenv("LAYER_TEST_NAME", "from-env")
+	t.Setenv("LAYER_TEST_TRICKY", "${LAYER_TEST_NAME}")
+	merged, err := configbridge.MergeSources([]configbridge.Source{
+		src("base.yml", "otel_traces_export:\n  endpoint: http://${LAYER_TEST_TRICKY}\n"),
+		src("site.yml", "log_level: debug\ndiscovery:\n  instrument:\n    - name: $${LAYER_TEST_NAME}\n      open_ports: 80\n"),
+	})
+	require.NoError(t, err)
+	assert.True(t, merged.Expanded)
+
+	cfg, err := LoadConfigExpanded(bytes.NewReader(merged.Data), nil)
+	require.NoError(t, err)
+	// a value that contains a placeholder is not expanded again, and an escaped one stays literal
+	assert.Equal(t, "http://${LAYER_TEST_NAME}", cfg.Traces.TracesEndpoint)
+	assert.Equal(t, "${LAYER_TEST_NAME}", cfg.Discovery.Instrument[0].Name)
 }
